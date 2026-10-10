@@ -1,0 +1,15 @@
+# Rust build outputs
+/target/
+
+# Local settings and sensitive files
+.env
+.env.*
+!.env.example
+*.log
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.user
+*.suo
