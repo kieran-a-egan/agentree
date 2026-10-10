@@ -18,6 +18,8 @@ jobs:
   validate:
     name: Rust validation (Windows)
     runs-on: windows-latest
+    env:
+      RUST_BACKTRACE: '1'
     timeout-minutes: 35
     steps:
       - name: Checkout
@@ -37,7 +39,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run unit and regression tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets -- --nocapture
 
       - name: Clippy (deny warnings)
         run: cargo clippy --locked --all-targets -- -D warnings
