@@ -69,9 +69,7 @@ pub fn spawn(cli: &Path, project: &Path, session_id: &str, policy: &Path,
     let pair = pty.openpty(PtySize { rows: rows.max(4), cols: cols.max(20), pixel_width: 0, pixel_height: 0 })
         .context("Opening ConPTY")?;
     let (exe, prefix) = real_cli_argv(cli)?;
-    let backend = if cli.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("cmd") || x.eq_ignore_ascii_case("bat")) {
-        "npm/node".to_string()
-    } else { "native".to_string() };
+    let backend = if prefix.is_empty() { "native" } else { "npm/node" }.to_string();
     let mut cmd = CommandBuilder::new(exe.as_os_str());
     cmd.args(prefix);
     cmd.arg("--model"); cmd.arg("claude-haiku-5-5");
@@ -149,11 +147,6 @@ pub fn cli_path() -> Result<PathBuf> {
         for filename in ["claude.exe", "claude.cmd", "claude.bat"] {
             let p = directory.join(filename);
             if !p.is_file() || exe.as_ref() == Some(&p) { continue; }
-            if filename == "claude.cmd" {
-                if let Ok(contents) = std::fs::read_to_string(&p) {
-                    if contents.contains("CLAUDE_TREE_SHIM_DIR=") && contents.contains("claude-agent-tree.exe") { continue; }
-                }
-            }
             return Ok(p);
         }
     }

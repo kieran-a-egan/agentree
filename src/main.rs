@@ -50,11 +50,12 @@ pub enum Page { Setup, Browser, Running, Finished }
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub enum Focus { Project, Objective, Native, Response }
 #[derive(Debug,Default,Deserialize)]
+#[serde(default)]
 pub struct Attention {
-    #[serde(default)] pub title: String,
-    #[serde(default)] pub reason: String,
-    #[serde(default)] pub question: String,
-    #[serde(default)] pub options: Vec<String>,
+    pub title: String,
+    pub reason: String,
+    pub question: String,
+    pub options: Vec<String>,
 }
 
 pub struct App {
@@ -97,8 +98,6 @@ pub struct App {
     pub native_first_data_ms: Option<u128>,
     pub last_diagnostic: Instant,
     pub child_exit: Option<String>,
-    /// The Claude TUI has visibly reported an Opus advisor invocation.
-    pub advisor_terminal_seen: bool,
     /// Observations from the live embedded terminal, independent of JSONL flushes.
     pub live: live::LiveSignals,
     /// New response/tool counters provide a bounded recent-activity pulse.
@@ -120,7 +119,7 @@ impl App {
             terminal:vt100::Parser::new(24,80,300), session:None,attention_file:run_dir.join("attention.json"),
             run_dir, started:Instant::now(), finished_elapsed:None,clock_paused_manually:false, agent_done_elapsed:HashMap::new(), session_started_at:SystemTime::now(), demo:args.demo, output_end:false,
             last_team_poll:Instant::now(),terminal_size:(24,80),close_confirm:false,
-            native_screen_visible:false,native_received_bytes:0,native_first_data_ms:None,last_diagnostic:Instant::now(),child_exit:None,advisor_terminal_seen:false, live:Default::default(), activity:Default::default() }
+            native_screen_visible:false,native_received_bytes:0,native_first_data_ms:None,last_diagnostic:Instant::now(),child_exit:None, live:Default::default(), activity:Default::default() }
     }
     fn browser_open(&mut self) {
         self.browser_dir = if path_input(&self.project).is_dir() {path_input(&self.project)}
@@ -141,7 +140,7 @@ impl App {
             .with_context(||format!("Project folder not accessible: {}",self.project))?;
         if !project.is_dir() { anyhow::bail!("Select a directory, not a file"); }
         if self.objective.trim().is_empty() { anyhow::bail!("Enter an objective before starting"); }
-        if !self.demo { let _ = pty::cli_path()?; }
+        let cli=if self.demo {None} else {Some(pty::cli_path()?)};
         self.project=project.display().to_string();
         let mut pref = read_prefs();
         pref.projects.retain(|x|x!=&self.project);
@@ -162,17 +161,16 @@ impl App {
         self.started=Instant::now();
         self.finished_elapsed=None; self.clock_paused_manually=false; self.agent_done_elapsed.clear();
         self.session_started_at=SystemTime::now();
-        if self.demo {
-            self.terminal.process(b"\x1b[32mDEMO - no Claude process launched\x1b[0m\r\nNative teammates and attention are simulated only in --demo mode.\r\n");
-            self.message="SIMULATED dashboard. No model calls, no edits.".into();
-        } else {
-            let cli=pty::cli_path()?;
+        if let Some(cli)=cli {
             self.session=Some(pty::spawn(&cli,&project,&self.session_id,&policy_file,&initial,rows,cols)?);
             self.message=format!("Claude process launched. Waiting for terminal startup | {}",self.session_id);
+        } else {
+            self.terminal.process(b"\x1b[32mDEMO - no Claude process launched\x1b[0m\r\nNative teammates and attention are simulated only in --demo mode.\r\n");
+            self.message="SIMULATED dashboard. No model calls, no edits.".into();
         }
         self.page=Page::Running;self.focus=Focus::Native;
         self.terminal_expanded=false;self.output_end=false;self.close_confirm=false;self.team=Default::default();self.telemetry.reset();self.agent_seen.clear();self.attention=None;
-        self.native_screen_visible=false;self.native_received_bytes=0;self.native_first_data_ms=None;self.last_diagnostic=Instant::now();self.child_exit=None;self.advisor_terminal_seen=false;self.live=Default::default();self.activity=Default::default();
+        self.native_screen_visible=false;self.native_received_bytes=0;self.native_first_data_ms=None;self.last_diagnostic=Instant::now();self.child_exit=None;self.live=Default::default();self.activity=Default::default();
         Ok(())
     }
     fn poll(&mut self,area:ratatui::layout::Rect) {
@@ -199,12 +197,8 @@ impl App {
                         // transcripts are flushed. Observe *visible* signals on
                         // every PTY update, not only after a session ends.
                         let screen=self.terminal.screen().contents();
-                        self.live.observe_screen(&screen,&self.session_id,Instant::now());
-                        self.advisor_terminal_seen |= self.live.advisor_seen;
-                        if !self.native_screen_visible &&
-                            self.terminal.screen().contents().chars().any(|c| !c.is_whitespace()) {
-                            self.native_screen_visible=true;
-                        }
+                        self.live.observe_screen(&screen,&self.session_id);
+                        self.native_screen_visible |= screen.chars().any(|c| !c.is_whitespace());
                     },
                     Ok(pty::PtyEvent::End(e))=>{self.output_end=true;self.message=e;break;},
                     Err(_)=>break,
@@ -213,18 +207,15 @@ impl App {
         }
         // ConPTY can remain open after a child exits. Poll the child process
         // independently so a failed Claude launch is never shown as "waiting".
-        if !self.output_end {
-            if let Some(s)=&mut self.session {
-                match s.child.try_wait() {
-                    Ok(Some(status)) => {
-                        let detail=format!("Claude exited: {:?}",status);
-                        self.child_exit=Some(detail.clone());
-                        self.output_end=true;
-                        self.message=detail;
-                    },
-                    Err(error) => { self.message=format!("Claude process status error: {}",error); },
-                    _ => {},
-                }
+        if let Some(s)=&mut self.session {
+            match s.child.try_wait() {
+                Ok(Some(status)) => {
+                    self.child_exit=Some(format!("{:?}",status));
+                    self.output_end=true;
+                    self.message=format!("Claude session exited: {:?}",status);
+                },
+                Err(error) if !self.output_end => { self.message=format!("Claude process status error: {}",error); },
+                _ => {},
             }
         }
         if self.last_team_poll.elapsed()>=Duration::from_millis(850) {
@@ -233,7 +224,7 @@ impl App {
             for agent in &self.team.agents {
                 self.agent_seen.entry(agent.name.clone()).or_insert_with(Instant::now);
             }
-            self.telemetry.refresh(&team::claude_home(), &self.session_id, &self.team, self.session_started_at, &self.session_id);
+            self.telemetry.refresh(&team::claude_home(), &self.session_id, &self.team, self.session_started_at);
             // Activity pulses are keyed to new *records*, not the last-write
             // time of an entire transcript. A teammate can remain assigned
             // while its animation has correctly returned to idle.
@@ -288,12 +279,6 @@ impl App {
         }
         if self.output_end {
             if self.finished_elapsed.is_none(){self.finished_elapsed=Some(self.started.elapsed());}
-            if let Some(s)=&mut self.session {
-                if let Ok(Some(exit))=s.child.try_wait() {
-                    self.child_exit=Some(format!("{:?}",exit));
-                    self.message=format!("Claude session exited: {:?}",exit);
-                }
-            }
             self.page=Page::Finished; self.focus=Focus::Native;
         }
     }
@@ -319,9 +304,9 @@ impl App {
         let ctrl=key.modifiers.contains(KeyModifiers::CONTROL);
         match self.page {
             Page::Setup => {
-                // Clear the entire multiline objective from either setup field.
+                // Ctrl+L clears the entire multiline objective from either setup field.
                 // Also discard the saved objective so a restart does not restore it.
-                if is_clear_objective_key(key) {
+                if ctrl && matches!(key.code,KeyCode::Char('l'|'L')) {
                     self.objective.clear();
                     self.focus=Focus::Objective;
                     let mut prefs=read_prefs();
@@ -425,12 +410,6 @@ impl App {
     }
 }
 
-// Ctrl+L is intercepted only on the setup page, never in Claude's terminal.
-fn is_clear_objective_key(event:KeyEvent)->bool {
-    event.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(event.code, KeyCode::Char('l' | 'L'))
-}
-
 // Correct VT input sequences; normal characters go straight to the native Claude terminal.
 fn key_bytes(event:KeyEvent)->Option<Vec<u8>> {
     let c=event.code;
@@ -495,12 +474,6 @@ fn main()->Result<()> {
     #[test] fn key_maps_normal_and_ctrl_c() {
         assert_eq!(key_bytes(KeyEvent::new(KeyCode::Char('c'),KeyModifiers::CONTROL)),Some(vec![3]));
         assert_eq!(key_bytes(KeyEvent::new(KeyCode::Enter,KeyModifiers::NONE)),Some(vec![13]));
-    }
-    #[test] fn objective_clear_shortcut_is_ctrl_l_only() {
-        assert!(is_clear_objective_key(KeyEvent::new(KeyCode::Char('l'),KeyModifiers::CONTROL)));
-        assert!(is_clear_objective_key(KeyEvent::new(KeyCode::Char('L'),KeyModifiers::CONTROL | KeyModifiers::SHIFT)));
-        assert!(!is_clear_objective_key(KeyEvent::new(KeyCode::Char('l'),KeyModifiers::NONE)));
-        assert!(!is_clear_objective_key(KeyEvent::new(KeyCode::Char('c'),KeyModifiers::CONTROL)));
     }
     #[test] fn run_clock_can_be_frozen_without_stopping_claude() {
         let mut a=App::new(Args{project:None,objective:None,demo:true});

@@ -39,21 +39,6 @@ $destination = Join-Path $bin 'agentree.exe'
 Copy-Item -LiteralPath $exe -Destination $destination -Force
 Set-Content -LiteralPath (Join-Path $bin 'claude-original.txt') -Value $ClaudeCli -Encoding UTF8
 
-foreach ($shimName in @('agentree.cmd','claude.cmd')) {
-    $legacyShim = Join-Path $bin $shimName
-    if (Test-Path -LiteralPath $legacyShim -PathType Leaf) {
-        $contents = Get-Content -LiteralPath $legacyShim -Raw
-        $isOurs = $contents.Contains('claude-agent-tree.exe') -and
-            ($shimName -eq 'agentree.cmd' -or $contents.Contains('CLAUDE_TREE_SHIM_DIR='))
-        if ($isOurs) {
-            Remove-Item -LiteralPath $legacyShim -Force
-            Write-Host "Removed legacy Agentree batch wrapper: $shimName" -ForegroundColor Yellow
-        } else {
-            Write-Warning "Unrecognised $legacyShim left untouched. Check command precedence with Get-Command."
-        }
-    }
-}
-
 if (-not $NoShim) {
     $userPath = [Environment]::GetEnvironmentVariable('Path','User')
     $parts = @($userPath -split ';' | Where-Object { $_ -and $_.Trim() })

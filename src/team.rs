@@ -4,50 +4,28 @@ use std::{collections::BTreeMap, fs, io::{BufRead, BufReader}, path::{Path, Path
 #[derive(Default, Clone, Debug)]
 pub struct Agent {
     pub name: String,
-    pub model: String,
     pub role: String,
     pub session_id: String,
     pub state: String,
     pub task: String,
 }
-#[derive(Default, Clone, Debug, PartialEq, Eq)]
-pub enum TeamKind {
-    #[default]
-    None,
-    Native,
-    BackgroundSubagents,
-}
-
 #[derive(Default, Clone, Debug)]
 pub struct TeamSnapshot {
-    pub kind: TeamKind,
     pub detected: bool,
     pub verified: bool,
     /// Linked by project and startup time, not by the CLI-requested UUID.
     pub project_linked: bool,
     pub claude_lead_session_id: String,
     pub agents: Vec<Agent>,
-    pub tasks_total: usize,
-    pub tasks_done: usize,
-    pub tasks_active: usize,
-    pub detail: Vec<String>,
     pub team_name: String,
     pub discovery: String,
 }
 #[derive(Default, Deserialize)]
-struct TeamConfig {
-    #[serde(default)] members: Vec<Member>,
-    #[serde(rename="leadSessionId", default)] lead_session_id: String,
-    #[serde(default)] cwd: String,
-}
+#[serde(default, rename_all="camelCase")]
+struct TeamConfig { members: Vec<Member>, lead_session_id: String, cwd: String }
 #[derive(Default, Deserialize)]
-struct Member {
-    #[serde(default)] name: String,
-    #[serde(rename="agentType", default)] agent_type: String,
-    #[serde(default)] model: String,
-    #[serde(rename="sessionId", default)] session_id: String,
-    #[serde(default)] cwd: String,
-}
+#[serde(default, rename_all="camelCase")]
+struct Member { name: String, agent_type: String, session_id: String, cwd: String }
 fn value_as_text(v: Option<&serde_json::Value>) -> String {
     v.and_then(serde_json::Value::as_str).unwrap_or("").to_owned()
 }
@@ -94,12 +72,10 @@ fn created_during_run(file: &Path, started_at: SystemTime) -> bool {
 
 pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
                 started_at: SystemTime) -> TeamSnapshot {
-    let expected_name = format!("session-{}", &session_id[..session_id.len().min(8)]);
     let team_root = claude_home.join("teams");
     let mut state = TeamSnapshot::default();
     let mut exact: Option<(String, TeamConfig)> = None;
     let mut project_candidates: Vec<(String, TeamConfig)> = Vec::new();
-    let mut weak_candidates: Vec<(String, TeamConfig)> = Vec::new();
     let mut scanned=0usize;
     if let Ok(entries)=fs::read_dir(&team_root) {
         for entry in entries.flatten() {
@@ -114,17 +90,9 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
                 exact=Some((name,config));
                 break;
             }
-            // A folder alone is insufficient if Claude explicitly records a
-            // different leadSessionId (the failure in the Forgeboard run).
-            if name==expected_name && config.lead_session_id.is_empty() {
-                exact=Some((name,config));
-                break;
-            }
             if !created_during_run(&file,started_at) { continue; }
             if belongs_to_project(&config,project,claude_home) {
                 project_candidates.push((name,config));
-            } else if config.lead_session_id.is_empty() {
-                weak_candidates.push((name,config));
             }
         }
     }
@@ -139,11 +107,6 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
     } else if project_candidates.len()>1 {
         state.discovery=format!("{} new teams match project; ambiguous, not linked", project_candidates.len());
         None
-    } else if weak_candidates.len()==1 && session_subagents(claude_home,session_id).is_none() {
-        // An old-format config lacking a lead ID and cwd is only a hint.
-        // Display members as unverified, never claim a confirmed native team.
-        state.discovery="new team config found; session/project unverified".into();
-        weak_candidates.pop()
     } else {
         state.discovery=format!("no linked native team; {} config(s) scanned",scanned);
         None
@@ -157,15 +120,13 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
         return state;
     };
     state.claude_lead_session_id=config.lead_session_id.clone();
-    state.kind = TeamKind::Native;
     state.detected = true;
     state.team_name = team_name.clone();
     for m in config.members {
         if m.agent_type == "team-lead" { continue; }
         if m.name.is_empty() { continue; }
-        state.agents.push(Agent { name: m.name, model: m.model,
-            role: m.agent_type, session_id: m.session_id, state: if state.verified || state.project_linked {"TEAM MEMBER"} else {"UNVERIFIED"}.into(),
-            task: String::new() });
+        state.agents.push(Agent { name: m.name, role: m.agent_type, session_id: m.session_id,
+            state: "TEAM MEMBER".into(), task: String::new() });
     }
     let task_dir = claude_home.join("tasks").join(&team_name);
     if let Ok(entries) = fs::read_dir(&task_dir) {
@@ -174,19 +135,11 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
             if let Ok(text) = fs::read_to_string(entry.path()) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if v.get("status").is_none() { continue; }
-                    state.tasks_total += 1;
                     let status = value_as_text(v.get("status"));
-                    match status.as_str() {
-                        "completed" => state.tasks_done += 1,
-                        "in_progress" => state.tasks_active += 1,
-                        _ => (),
-                    }
-                    let subject = value_as_text(v.get("subject"));
                     let owner = value_as_text(v.get("owner"));
-                    state.detail.push(format!("{} [{}] {}", subject, status, owner));
                     if !owner.is_empty() {
                         if let Some(a) = state.agents.iter_mut().find(|a| a.name == owner) {
-                            a.task = subject;
+                            a.task = value_as_text(v.get("subject"));
                             a.state = match status.as_str() {
                                 "completed" => "TASK COMPLETE", "in_progress" => "WORKING", _ => "WAITING"
                             }.into();
@@ -196,7 +149,6 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
             }
         }
     }
-    state.detail.sort();
     state
 }
 
@@ -229,7 +181,6 @@ fn session_subagents(claude_home: &Path, session_id: &str) -> Option<TeamSnapsho
             let display_name = value_as_text(details.get("name"));
             let description = value_as_text(details.get("description"));
             let role = value_as_text(details.get("agentType"));
-            let model = value_as_text(details.get("model"));
             let name = if display_name.is_empty() {
                 format!("agent-{}", id.chars().take(8).collect::<String>())
             } else { display_name };
@@ -238,13 +189,12 @@ fn session_subagents(claude_home: &Path, session_id: &str) -> Option<TeamSnapsho
                 .and_then(|modified|SystemTime::now().duration_since(modified).ok())
                 .is_some_and(|age|age < Duration::from_secs(30));
             let task = if description.is_empty() { "Delegated subagent task".into() } else { description };
-            agents.insert(id.to_string(), Agent { name, role, model, session_id: String::new(),
+            agents.insert(id.to_string(), Agent { name, role, session_id: String::new(),
                 state: if recent { "RECENT OUTPUT" } else { "RECORDED" }.into(), task });
         }
     }
     if agents.is_empty() { return None; }
     Some(TeamSnapshot {
-        kind: TeamKind::BackgroundSubagents,
         detected: true, verified: false,
         agents: agents.into_values().collect(),
         team_name: String::new(),
@@ -292,15 +242,6 @@ pub fn claude_home() -> PathBuf {
         assert!(!s.detected);
         fs::remove_dir_all(home).unwrap();
     }
-    #[test] fn recent_unverified_team_is_labelled_as_such() {
-        let home=temp_fixture();
-        let p=home.join("teams").join("custom-team"); fs::create_dir_all(&p).unwrap();
-        fs::write(p.join("config.json"),r#"{"members":[{"name":"explorer","agentType":"general-purpose"}]}"#).unwrap();
-        let s=snapshot(&home,"not-a-match",Path::new("/some-project"),SystemTime::now()-Duration::from_secs(60));
-        assert!(s.detected && !s.verified);
-        assert_eq!(s.agents[0].state,"UNVERIFIED");
-        fs::remove_dir_all(home).unwrap();
-    }
     #[test] fn background_subagents_are_visible_but_not_native_team() {
         let home=temp_fixture();
         let session="session-with-workers";
@@ -309,12 +250,11 @@ pub fn claude_home() -> PathBuf {
         fs::write(dir.join("agent-abc123.meta.json"), r#"{"agentType":"general-purpose","name":"coder-frontend","description":"Build React UI"}"#).unwrap();
         fs::write(dir.join("agent-abc123.jsonl"), "{\"type\":\"assistant\"}\n").unwrap();
         let result=snapshot(&home,session,Path::new("/some-project"),SystemTime::now());
-        assert_eq!(result.kind,TeamKind::BackgroundSubagents);
         assert!(result.detected && !result.verified);
         assert_eq!(result.agents.len(),1);
         assert_eq!(result.agents[0].name,"coder-frontend");
         assert_eq!(result.agents[0].task,"Build React UI");
-        assert_eq!(result.tasks_total,0);
+        assert_eq!(result.agents[0].state,"RECENT OUTPUT");
         let other=snapshot(&home,"other-session",Path::new("/some-project"),SystemTime::now());
         assert!(!other.detected);
         fs::remove_dir_all(home).unwrap();
@@ -328,8 +268,8 @@ pub fn claude_home() -> PathBuf {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("agent-xyz.meta.json"),r#"{"description":"Extra"}"#).unwrap();
         let result=snapshot(&home,session,Path::new("/some-project"),SystemTime::now());
-        assert_eq!(result.kind,TeamKind::Native);
         assert!(result.verified);
+        assert_eq!(result.agents[0].state,"TEAM MEMBER");
         fs::remove_dir_all(home).unwrap();
     }
     #[test] fn associates_forgeboard_native_team_by_cwd_and_start_time() {

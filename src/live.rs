@@ -19,7 +19,7 @@ pub struct LiveSignals {
     prior_visible_results: usize,
 }
 impl LiveSignals {
-    pub fn observe_screen(&mut self, screen:&str, token:&str, _now:Instant) {
+    pub fn observe_screen(&mut self, screen:&str, token:&str) {
         if token.is_empty(){return;}
         let start_marker=format!("AGENTREE_REVIEW_START:{token}");
         let done_marker=format!("AGENTREE_OBJECTIVE_COMPLETE:{token}");
@@ -97,32 +97,30 @@ mod tests {
     #[test]
     fn detects_final_audit_while_terminal_is_still_running(){
         let mut s=LiveSignals::default();
-        let now=Instant::now();
-        s.observe_screen("text\nAGENTREE_REVIEW_START:abc-123\n", "abc-123",now);
+        s.observe_screen("text\nAGENTREE_REVIEW_START:abc-123\n", "abc-123");
         assert!(s.review_started);
         assert!(!s.advisor_after_review);
-        s.observe_screen("AGENTREE_REVIEW_START:abc-123\nAdvising using Opus 5.5\n", "abc-123",now);
+        s.observe_screen("AGENTREE_REVIEW_START:abc-123\nAdvising using Opus 5.5\n", "abc-123");
         assert!(s.advisor_in_flight && s.advisor_after_review);
-        s.observe_screen("AGENTREE_REVIEW_START:abc-123\nAdvising using Opus 5.5\nAdvisor has reviewed the conversation\n", "abc-123",now);
+        s.observe_screen("AGENTREE_REVIEW_START:abc-123\nAdvising using Opus 5.5\nAdvisor has reviewed the conversation\n", "abc-123");
         assert!(!s.advisor_in_flight);
-        s.observe_screen("AGENTREE_REVIEW_RESULT:abc-123:PASS\nAGENTREE_OBJECTIVE_COMPLETE:abc-123", "abc-123",now);
+        s.observe_screen("AGENTREE_REVIEW_RESULT:abc-123:PASS\nAGENTREE_OBJECTIVE_COMPLETE:abc-123", "abc-123");
         assert_eq!(s.review_result.as_deref(),Some("PASS"));
         assert!(s.objective_complete);
     }
     #[test]
     fn wrapped_markers_are_detected(){
         let mut s=LiveSignals::default();
-        s.observe_screen("AGENTREE_REVIEW_START:abc-\n123\n", "abc-123",Instant::now());
+        s.observe_screen("AGENTREE_REVIEW_START:abc-\n123\n", "abc-123");
         assert!(s.review_started);
-        s.observe_screen("AGENTREE_OBJECTIVE_COMPLETE:abc-\n123", "abc-123",Instant::now());
+        s.observe_screen("AGENTREE_OBJECTIVE_COMPLETE:abc-\n123", "abc-123");
         assert!(s.objective_complete);
     }
     #[test]
     fn old_advice_on_screen_is_not_confused_with_final_review(){
         let mut s=LiveSignals::default();
-        let now=Instant::now();
-        s.observe_screen("Advising using Opus 5.5\nAdvisor has reviewed the conversation", "run", now);
-        s.observe_screen("Advising using Opus 5.5\nAdvisor has reviewed the conversation\nAGENTREE_REVIEW_START:run", "run", now);
+        s.observe_screen("Advising using Opus 5.5\nAdvisor has reviewed the conversation", "run");
+        s.observe_screen("Advising using Opus 5.5\nAdvisor has reviewed the conversation\nAGENTREE_REVIEW_START:run", "run");
         assert!(s.review_started);
         assert!(!s.advisor_after_review);
         assert!(!s.advisor_in_flight);

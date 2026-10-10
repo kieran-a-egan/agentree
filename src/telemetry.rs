@@ -21,10 +21,8 @@ pub struct Totals {
     pub model: String,
     pub action: String,
     pub last_timestamp: String,
-    pub first_timestamp: String,
     pub has_pricing_gap: bool,
     pub opus_calls: u64,
-    pub last_activity: Option<SystemTime>,
 }
 impl Totals {
     pub fn tokens(&self) -> u64 { self.input + self.output + self.cache_read + self.cache_write }
@@ -36,9 +34,6 @@ impl Totals {
         self.list_usd += other.list_usd;
         self.has_pricing_gap |= other.has_pricing_gap;
         self.opus_calls += other.opus_calls;
-        if let Some(t)=other.last_activity {
-            if self.last_activity.is_none_or(|old|t>old) {self.last_activity=Some(t);}
-        }
     }
 }
 #[derive(Clone, Debug)]
@@ -113,6 +108,23 @@ fn pricing(model:&str, input:u64, output:u64, cache5:u64, cache1:u64, read:u64, 
     Some((input as f64*i + output as f64*o + cache5 as f64*w5
         + cache1 as f64*w1 + read as f64*r)/1_000_000.0)
 }
+fn add_usage(t:&mut Totals,usage:&Value,model:&str){
+    let input=u64_field(usage,"input_tokens");
+    let output=u64_field(usage,"output_tokens");
+    let read=u64_field(usage,"cache_read_input_tokens");
+    let create=u64_field(usage,"cache_creation_input_tokens");
+    // Whatever cache write is not itemised as 1h is priced at the 5m rate.
+    let write1=u64_field(&usage["cache_creation"],"ephemeral_1h_input_tokens").min(create);
+    let ctx=input+read+create;
+    t.context_latest=ctx;
+    t.input+=input;t.output+=output;t.cache_read+=read;t.cache_write+=create;
+    t.calls+=1;
+    if model.contains("opus") {t.opus_calls+=1;}
+    match pricing(model,input,output,create-write1,write1,read,ctx) {
+        Some(usd)=>t.list_usd+=usd,
+        None=>t.has_pricing_gap=true,
+    }
+}
 fn is_fresh(path:&Path, started:SystemTime)->bool {
     let earliest=started.checked_sub(Duration::from_secs(15)).unwrap_or(started);
     path.metadata().ok().and_then(|m|m.modified().ok()).is_some_and(|t|t>=earliest)
@@ -129,22 +141,11 @@ fn labelled_agent(path:&Path, names:&[String])->Option<String>{
     let filename=path.file_name()?.to_string_lossy();
     let id=filename.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
     let meta=path.with_file_name(format!("agent-{}.meta.json",id));
-    if let Some(name)=recorded_name(&meta) {if names.contains(&name){return Some(name);}}
-    let file=fs::File::open(path).ok()?;
-    for line in BufReader::new(file).lines().take(12).flatten(){
-        if let Ok(v)=serde_json::from_str::<Value>(&line){
-            for key in ["agentName","agent_name","name"] {
-                if let Some(name)=v.get(key).and_then(Value::as_str) {
-                    if names.iter().any(|n|n==name){return Some(name.into());}
-                }
-            }
-        }
-    }
-    None
+    recorded_name(&meta).filter(|name|names.contains(name))
 }
 impl Telemetry {
     pub fn reset(&mut self) { *self=Self::default(); }
-    pub fn refresh(&mut self,home:&Path,requested_session:&str,team:&TeamSnapshot,started:SystemTime,run_token:&str){
+    pub fn refresh(&mut self,home:&Path,requested_session:&str,team:&TeamSnapshot,started:SystemTime){
         let lead=if !team.claude_lead_session_id.is_empty(){team.claude_lead_session_id.as_str()}else{requested_session};
         let names:Vec<String>=team.agents.iter().map(|x|x.name.clone()).collect();
         let mut paths=Vec::<(PathBuf,String)>::new();
@@ -175,11 +176,7 @@ impl Telemetry {
             let trace=self.files.entry(path.clone()).or_default();
             trace.role=role.clone();
             let mut fresh_events=Vec::new();
-            let prior_offset=trace.offset;
-            let _=consume_trace(&path,trace,&role,&mut fresh_events,run_token);
-            if trace.offset != prior_offset {
-                trace.totals.last_activity=path.metadata().ok().and_then(|m|m.modified().ok());
-            }
+            let _=consume_trace(&path,trace,&role,&mut fresh_events,requested_session);
             for e in fresh_events {self.events.push_back(e);}
             while self.events.len()>MAX_EVENTS {self.events.pop_front();}
         }
@@ -223,13 +220,7 @@ impl Telemetry {
 fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity>,run_token:&str)->std::io::Result<()> {
     let mut f=fs::File::open(path)?;
     let len=f.metadata()?.len();
-    if len<trace.offset {trace.offset=0; trace.seen_responses.clear(); trace.seen_tools.clear();
-        trace.seen_advisor_blocks.clear();trace.seen_advisor_results.clear();
-        trace.seen_advisor_iterations.clear();trace.advisor_invocations=0;
-        trace.advisor_completed=0;trace.advisor=Totals::default();
-        trace.review_started=false;trace.review_result=None;trace.objective_complete=false;
-        trace.advisor_completed_before_review=0;trace.advisor_usage_before_review=0;
-        trace.totals=Totals::default();}
+    if len<trace.offset {*trace=Trace{role:std::mem::take(&mut trace.role),..Default::default()};}
     f.seek(SeekFrom::Start(trace.offset))?;
     let mut reader=BufReader::new(f);
     loop {
@@ -245,32 +236,12 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
         let msg=&v["message"];
         let model=msg.get("model").and_then(Value::as_str).unwrap_or("");
         let timestamp=v.get("timestamp").and_then(Value::as_str).unwrap_or("");
-        if !timestamp.is_empty(){
-            if trace.totals.first_timestamp.is_empty(){trace.totals.first_timestamp=timestamp.into();}
-            trace.totals.last_timestamp=timestamp.into();
-        }
+        let hms:String=timestamp.chars().skip(11).take(8).collect();
+        if !timestamp.is_empty(){trace.totals.last_timestamp=timestamp.into();}
         if !model.is_empty(){trace.totals.model=model.into();}
         if let Some(usage)=msg.get("usage") {
             if let Some(id)=msg.get("id").and_then(Value::as_str){
-                if trace.seen_responses.insert(id.to_owned()){
-                    let input=u64_field(usage,"input_tokens");
-                    let output=u64_field(usage,"output_tokens");
-                    let cached=u64_field(usage,"cache_read_input_tokens");
-                    let create=u64_field(usage,"cache_creation_input_tokens");
-                    let cache1=u64_field(&usage["cache_creation"],"ephemeral_1h_input_tokens");
-                    let cache5=u64_field(&usage["cache_creation"],"ephemeral_5m_input_tokens");
-                    let write1=cache1.min(create);
-                    let write5=if cache5==0 && cache1==0 {create}else{cache5.min(create.saturating_sub(write1))};
-                    let ctx=input+cached+create;
-                    trace.totals.context_latest=ctx;
-                    trace.totals.input+=input;trace.totals.output+=output;
-                    trace.totals.cache_read+=cached;trace.totals.cache_write+=create;
-                    trace.totals.calls+=1;
-                    if model.contains("opus-5-5") {trace.totals.opus_calls+=1;}
-                    if let Some(usd)=pricing(model,input,output,write5,write1,cached,ctx) {
-                        trace.totals.list_usd+=usd;
-                    } else {trace.totals.has_pricing_gap=true;}
-                }
+                if trace.seen_responses.insert(id.to_owned()){add_usage(&mut trace.totals,usage,model);}
             }
         }
         // Advisor calls are server-side and are nested *inside* Haiku's
@@ -282,22 +253,9 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
                     if iteration.get("type").and_then(Value::as_str)!=Some("advisor_message"){continue;}
                     if !trace.seen_advisor_iterations.insert(format!("{id}:{index}")){continue;}
                     let model=iteration.get("model").and_then(Value::as_str).unwrap_or("");
-                    let input=u64_field(iteration,"input_tokens");
-                    let output=u64_field(iteration,"output_tokens");
-                    let read=u64_field(iteration,"cache_read_input_tokens");
-                    let create=u64_field(iteration,"cache_creation_input_tokens");
-                    let cache1=u64_field(&iteration["cache_creation"],"ephemeral_1h_input_tokens").min(create);
-                    let cache5=if cache1==0 {create}else{create.saturating_sub(cache1)};
-                    trace.advisor.calls+=1;
-                    trace.advisor.input+=input;trace.advisor.output+=output;
-                    trace.advisor.cache_read+=read;trace.advisor.cache_write+=create;
-                    trace.advisor.context_latest=input+read+create;
-                    if model.contains("opus"){trace.advisor.opus_calls+=1;}
+                    add_usage(&mut trace.advisor,iteration,model);
                     if !model.is_empty(){trace.advisor.model=model.to_owned();}
                     trace.advisor.last_timestamp=timestamp.to_owned();
-                    if let Some(price)=pricing(model,input,output,cache5,cache1,read,input+read+create){
-                        trace.advisor.list_usd+=price;
-                    } else {trace.advisor.has_pricing_gap=true;}
                 }
             }
         }
@@ -317,7 +275,7 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
                             trace.objective_complete=false;
                             trace.advisor_completed_before_review=trace.advisor_completed;
                             trace.advisor_usage_before_review=trace.advisor.calls;
-                            events.push(Activity{who:"Opus final review".into(),what:"Review stage requested by lead".into(),time:timestamp.chars().skip(11).take(8).collect()});
+                            events.push(Activity{who:"Opus final review".into(),what:"Review stage requested by lead".into(),time:hms.clone()});
                         }
                         if trace.review_started {
                             let prefix=format!("AGENTREE_REVIEW_RESULT:{run_token}:");
@@ -328,7 +286,7 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
                             }
                             if line==format!("AGENTREE_OBJECTIVE_COMPLETE:{run_token}") {
                                 trace.objective_complete=true;
-                                events.push(Activity{who:"main".into(),what:"Objective marked complete".into(),time:timestamp.chars().skip(11).take(8).collect()});
+                                events.push(Activity{who:"main".into(),what:"Objective marked complete".into(),time:hms.clone()});
                             }
                         }
                     }
@@ -341,14 +299,14 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
                 if kind=="server_tool_use" && block.get("name").and_then(Value::as_str)==Some("advisor") {
                     if !use_id.is_empty() && trace.seen_advisor_blocks.insert(use_id.to_owned()) {
                         trace.advisor_invocations+=1;
-                        events.push(Activity{who:"Opus advisor".into(),what:"Consultation invoked".into(),time:timestamp.chars().skip(11).take(8).collect()});
+                        events.push(Activity{who:"Opus advisor".into(),what:"Consultation invoked".into(),time:hms.clone()});
                     }
                 }
                 if kind=="advisor_tool_result" && !use_id.is_empty() && trace.seen_advisor_results.insert(use_id.to_owned()) {
                     // Some local transcript revisions omit the preceding server_tool_use.
                     if trace.seen_advisor_blocks.insert(use_id.to_owned()){trace.advisor_invocations+=1;}
                     trace.advisor_completed+=1;
-                    events.push(Activity{who:"Opus advisor".into(),what:"Consultation completed".into(),time:timestamp.chars().skip(11).take(8).collect()});
+                    events.push(Activity{who:"Opus advisor".into(),what:"Consultation completed".into(),time:hms.clone()});
                 }
                 if kind=="tool_use" {
                     let id=block.get("id").and_then(Value::as_str).map(str::to_owned);
@@ -356,7 +314,7 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
                     trace.totals.tools+=1;
                     let action=safe_action(block);
                     trace.totals.action=action.clone();
-                    events.push(Activity{who:role.into(),what:action,time:timestamp.chars().skip(11).take(8).collect()});
+                    events.push(Activity{who:role.into(),what:action,time:hms.clone()});
                 }
             }
         }
@@ -410,11 +368,11 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
         team.claude_lead_session_id="lead-1".into();
         team.agents.push(crate::team::Agent{name:"coder-frontend".into(),session_id:"worker-1".into(),..Default::default()});
         let mut obs=Telemetry::default();
-        obs.refresh(&root,"requested-id",&team,SystemTime::now(),"run-123");
+        obs.refresh(&root,"requested-id",&team,SystemTime::now());
         assert_eq!(obs.combined.calls,2);
         assert_eq!(obs.actors["main"].tools,1);
         assert_eq!(obs.actors["coder-frontend"].tools,1);
-        obs.refresh(&root,"requested-id",&team,SystemTime::now(),"run-123");
+        obs.refresh(&root,"requested-id",&team,SystemTime::now());
         assert_eq!(obs.combined.calls,2); // must not count the same file twice
         fs::remove_dir_all(root).unwrap();
     }

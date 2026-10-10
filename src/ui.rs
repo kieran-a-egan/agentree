@@ -203,7 +203,7 @@ fn lead_and_opus(frame:&mut Frame,area:Rect,app:&App){
     if active_agent(app,"main") {glow_border(frame,widths[0],ORANGE,app.started.elapsed().as_millis());}
     let mut advisor=vec![accent("OPUS 5.5  //  ON CALL".into(),OPUS)];
     let calls=app.telemetry.advisor_invocations.max(app.telemetry.advisor.calls);
-    let observed=app.advisor_terminal_seen || calls>0 || app.telemetry.observed_opus;
+    let observed=app.live.advisor_seen || calls>0 || app.telemetry.observed_opus;
     if calls>0 {
         advisor.push(Line::raw(format!("Advisor calls observed: {calls}")));
         if app.telemetry.advisor_completed>0 {
@@ -259,7 +259,7 @@ fn run_totals(frame:&mut Frame,area:Rect,app:&App){
         format!("Observed {} tokens  (I:{} O:{} Cache R:{} W:{})",
             count(t.tokens()),count(t.input),count(t.output),count(t.cache_read),count(t.cache_write))
     };
-    let missing_advisor_cost=(app.telemetry.advisor_invocations>0 || app.advisor_terminal_seen)
+    let missing_advisor_cost=(app.telemetry.advisor_invocations>0 || app.live.advisor_seen)
         && app.telemetry.advisor.calls==0;
     let spend=if app.telemetry.files_found==0 {"Estimated API cost: --".to_owned()}
         else if t.has_pricing_gap || missing_advisor_cost {
@@ -297,13 +297,8 @@ fn worker_card(frame:&mut Frame,area:Rect,app:&App,idx:usize){
     }
 }
 fn workers(frame:&mut Frame,area:Rect,app:&App){
-    if area.width>=65 {
-        let parts=divide(area,&[Constraint::Percentage(34),Constraint::Percentage(33),Constraint::Percentage(33)],true);
-        for (i,part) in parts.into_iter().enumerate(){worker_card(frame,part,app,i);}
-    } else {
-        let parts=divide(area,&[Constraint::Percentage(34),Constraint::Percentage(33),Constraint::Percentage(33)],false);
-        for (i,part) in parts.into_iter().enumerate(){worker_card(frame,part,app,i);}
-    }
+    let parts=divide(area,&[Constraint::Percentage(34),Constraint::Percentage(33),Constraint::Percentage(33)],area.width>=65);
+    for (i,part) in parts.into_iter().enumerate(){worker_card(frame,part,app,i);}
 }
 fn review_strip(frame:&mut Frame,area:Rect,app:&App){
     let review=&app.telemetry.review;
