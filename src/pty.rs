@@ -354,6 +354,25 @@ mod tests {
             .spawn_command(cmd)
             .expect("start child under ConPTY");
         drop(pair.slave);
+        // Mirror the real launcher: some Windows ConPTY implementations request
+        // device attributes before letting the child progress to its command.
+        // Not replying can leave an otherwise trivial cmd.exe process stalled.
+        let mut writer = pair.master.take_writer().expect("take ConPTY writer");
+        writer
+            .write_all(b"\x1b[?1;2c")
+            .and_then(|_| writer.flush())
+            .expect("answer ConPTY startup query");
+        // Drain ConPTY's initial terminal output while polling child exit.
+        // Otherwise some implementations can block the child on output.
+        let mut reader = pair.master.try_clone_reader().expect("clone ConPTY reader");
+        let _drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
         let deadline = Instant::now() + Duration::from_secs(15);
         while child.try_wait().expect("poll ConPTY child").is_none() {
             if Instant::now() >= deadline {
