@@ -358,4 +358,5 @@ mod tests {
         assert!(child.process_id().is_some(), "ConPTY child has no process ID");
         drop(pair.slave);
         child.kill().expect("terminate ConPTY child");
-    }}
+    }
+}
