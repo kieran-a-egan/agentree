@@ -174,6 +174,14 @@ fn count(v:u64)->String {
     else {v.to_string()}
 }
 fn uptime(seconds:u64)->String {format!("{:02}:{:02}:{:02}",seconds/3600,seconds/60%60,seconds%60)}
+/// An estimate only when the normalised `Usage.cost_usd` is observed. Otherwise it is a lower bound.
+fn cost_text(t:&crate::telemetry::Totals,basis:&str)->String {
+    if t.calls==0 {return "Cost unknown".into();}
+    match t.usage().cost_usd.get() {
+        Some(usd)=>format!("Cost ~${usd:.4} {basis}"),
+        None=>format!("Cost >=${:.4} + {}",t.list_usd,if t.has_pricing_gap {"unpriced"} else {"incomplete usage"}),
+    }
+}
 fn stats_lines(t:Option<&crate::telemetry::Totals>,max:usize)->Vec<Line<'static>> {
     let Some(t)=t else {return vec![accent("Tokens / cost: not linked".into(),MUTED),
         accent("Context: unknown".into(),MUTED)];};
@@ -182,7 +190,7 @@ fn stats_lines(t:Option<&crate::telemetry::Totals>,max:usize)->Vec<Line<'static>
         Line::raw(format!("Tokens {}  I:{}  O:{}",count(t.tokens()),count(t.input),count(t.output))),
         Line::raw(format!("Cache R:{}  W:{}",count(t.cache_read),count(t.cache_write))),
         accent(format!("Context ~{} / 1m",context),CYAN),
-        accent(if t.has_pricing_gap {format!("Cost >=${:.4} + unpriced",t.list_usd)} else {format!("Cost ~${:.4} list",t.list_usd)},ORANGE),
+        accent(cost_text(t,"list"),ORANGE),
         Line::raw(shorten(&format!("{} | {} calls",if t.model.is_empty(){"Model unknown"}else{&t.model},t.calls),max)),
     ]
 }
@@ -221,8 +229,7 @@ fn lead_and_opus(frame:&mut Frame,area:Rect,app:&App){
     if app.telemetry.advisor.calls>0 {
         let t=&app.telemetry.advisor;
         advisor.push(Line::raw(format!("Tokens {}  I:{}  O:{}",count(t.tokens()),count(t.input),count(t.output))));
-        advisor.push(accent(if t.has_pricing_gap{format!("Cost >=${:.4} + unpriced",t.list_usd)}
-                else {format!("Cost ~${:.4} API list",t.list_usd)},ORANGE));
+        advisor.push(accent(cost_text(t,"API list"),ORANGE));
     } else if observed {
         advisor.push(Line::raw("Advisor tokens/cost: unavailable"));
     }
@@ -262,10 +269,11 @@ fn run_totals(frame:&mut Frame,area:Rect,app:&App){
     };
     let missing_advisor_cost=(app.telemetry.advisor_invocations>0 || app.live.advisor_seen)
         && app.telemetry.advisor.calls==0;
-    let spend=if app.telemetry.files_found==0 {"Estimated API cost: --".to_owned()}
-        else if t.has_pricing_gap || missing_advisor_cost {
-            format!("Estimated API cost >=${:.4} + unobserved usage",t.list_usd)
-        } else {format!("Estimated API cost ~${:.4} USD list",t.list_usd)};
+    let spend=if app.telemetry.files_found==0 || t.calls==0 {"Estimated API cost: --".to_owned()}
+        else {match t.usage().cost_usd.get() {
+            Some(usd) if !missing_advisor_cost => format!("Estimated API cost ~${usd:.4} USD list"),
+            _ => format!("Estimated API cost >=${:.4} + unobserved usage",t.list_usd),
+        }};
     paragraph(frame,area,"RUN TOTALS / OBSERVED",vec![
         accent(format!("{}  |  Runtime {}{}  |  {} teammates  |  {} tools",
             status,elapsed,if app.finished_elapsed.is_some(){" (stopped)"}else{""},app.team.agents.len(),t.tools),CYAN),
@@ -457,5 +465,15 @@ pub fn draw(frame:&mut Frame,app:&App){
         assert_eq!(event_text(&tool("main.rs")),"Read main.rs");
         assert_eq!(event_text(&tool("")),"Read");
         assert_eq!(event_text(&EventKind::AdvisorCompleted),"Consultation completed");
+    }
+    #[test] fn cost_is_an_estimate_only_when_usage_cost_is_observed() {
+        use crate::telemetry::{Missing,Totals};
+        let observed=Totals{calls:1,list_usd:0.5,..Default::default()};
+        assert_eq!(cost_text(&observed,"list"),"Cost ~$0.5000 list");
+        let incomplete=Totals{missing:Missing{cache_read:true,..Default::default()},..observed.clone()};
+        assert_eq!(cost_text(&incomplete,"list"),"Cost >=$0.5000 + incomplete usage");
+        let unpriced=Totals{has_pricing_gap:true,..observed.clone()};
+        assert_eq!(cost_text(&unpriced,"list"),"Cost >=$0.5000 + unpriced");
+        assert_eq!(cost_text(&Totals::default(),"list"),"Cost unknown");
     }
 }
