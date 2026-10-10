@@ -45,6 +45,8 @@ fn path_input(s: &str) -> PathBuf {
     }
     PathBuf::from(s)
 }
+/// How long the PTY queue must stay quiet after Claude exits before finishing.
+const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(300);
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub enum Page { Setup, Browser, Running, Finished }
 #[derive(Clone,Copy,PartialEq,Eq)]
@@ -98,6 +100,7 @@ pub struct App {
     pub native_first_data_ms: Option<u128>,
     pub last_diagnostic: Instant,
     pub child_exit: Option<String>,
+    child_exited_at: Option<Instant>,
     /// Observations from the live embedded terminal, independent of JSONL flushes.
     pub live: live::LiveSignals,
     /// New response/tool counters provide a bounded recent-activity pulse.
@@ -119,7 +122,7 @@ impl App {
             terminal:vt100::Parser::new(24,80,300), session:None,attention_file:run_dir.join("attention.json"),
             run_dir, started:Instant::now(), finished_elapsed:None,clock_paused_manually:false, agent_done_elapsed:HashMap::new(), session_started_at:SystemTime::now(), demo:args.demo, output_end:false,
             last_team_poll:Instant::now(),terminal_size:(24,80),close_confirm:false,
-            native_screen_visible:false,native_received_bytes:0,native_first_data_ms:None,last_diagnostic:Instant::now(),child_exit:None, live:Default::default(), activity:Default::default() }
+            native_screen_visible:false,native_received_bytes:0,native_first_data_ms:None,last_diagnostic:Instant::now(),child_exit:None,child_exited_at:None, live:Default::default(), activity:Default::default() }
     }
     fn browser_open(&mut self) {
         self.browser_dir = if path_input(&self.project).is_dir() {path_input(&self.project)}
@@ -170,7 +173,7 @@ impl App {
         }
         self.page=Page::Running;self.focus=Focus::Native;
         self.terminal_expanded=false;self.output_end=false;self.close_confirm=false;self.team=Default::default();self.telemetry.reset();self.agent_seen.clear();self.attention=None;
-        self.native_screen_visible=false;self.native_received_bytes=0;self.native_first_data_ms=None;self.last_diagnostic=Instant::now();self.child_exit=None;self.live=Default::default();self.activity=Default::default();
+        self.native_screen_visible=false;self.native_received_bytes=0;self.native_first_data_ms=None;self.last_diagnostic=Instant::now();self.child_exit=None;self.child_exited_at=None;self.live=Default::default();self.activity=Default::default();
         Ok(())
     }
     fn poll(&mut self,area:ratatui::layout::Rect) {
@@ -183,6 +186,8 @@ impl App {
                 let _=s.master.resize(PtySize{rows,cols,pixel_width:0,pixel_height:0});
             }
         }
+        // `quiet` means the reader's queue was emptied without new output.
+        let (mut got_data,mut quiet)=(false,false);
         if let Some(s)=&mut self.session {
             for _ in 0..128 {
                 match s.receiver.try_recv() {
@@ -193,17 +198,20 @@ impl App {
                         self.native_received_bytes+=data.len() as u64;
                         s.answer_terminal_queries(&data);
                         self.terminal.process(&data);
-                        // Claude's terminal renders status before its JSONL
-                        // transcripts are flushed. Observe *visible* signals on
-                        // every PTY update, not only after a session ends.
-                        let screen=self.terminal.screen().contents();
-                        self.live.observe_screen(&screen,&self.session_id);
-                        self.native_screen_visible |= screen.chars().any(|c| !c.is_whitespace());
+                        got_data=true;
                     },
                     Ok(pty::PtyEvent::End(e))=>{self.output_end=true;self.message=e;break;},
-                    Err(_)=>break,
+                    Err(_)=>{quiet=!got_data;break;},
                 }
             }
+        }
+        if got_data {
+            // Claude's terminal renders status before its JSONL transcripts
+            // are flushed. Observe *visible* signals on every poll that
+            // brought PTY output, not only after a session ends.
+            let screen=self.terminal.screen().contents();
+            self.live.observe_screen(&screen,&self.session_id);
+            self.native_screen_visible = self.native_screen_visible || screen.chars().any(|c| !c.is_whitespace());
         }
         // ConPTY can remain open after a child exits. Poll the child process
         // independently so a failed Claude launch is never shown as "waiting".
@@ -211,8 +219,12 @@ impl App {
             match s.child.try_wait() {
                 Ok(Some(status)) => {
                     self.child_exit=Some(format!("{:?}",status));
-                    self.output_end=true;
                     self.message=format!("Claude session exited: {:?}",status);
+                    // The reader thread may still hold Claude's last output
+                    // (often the launch error). Finish only once the queue has
+                    // been quiet for a moment; ConPTY may never signal EOF.
+                    let exited=*self.child_exited_at.get_or_insert_with(Instant::now);
+                    if quiet && exited.elapsed()>=EXIT_DRAIN_GRACE {self.output_end=true;}
                 },
                 Err(error) if !self.output_end => { self.message=format!("Claude process status error: {}",error); },
                 _ => {},

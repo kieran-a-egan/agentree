@@ -72,10 +72,12 @@ fn created_during_run(file: &Path, started_at: SystemTime) -> bool {
 
 pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
                 started_at: SystemTime) -> TeamSnapshot {
+    let expected_name = format!("session-{}", session_id.chars().take(8).collect::<String>());
     let team_root = claude_home.join("teams");
     let mut state = TeamSnapshot::default();
     let mut exact: Option<(String, TeamConfig)> = None;
     let mut project_candidates: Vec<(String, TeamConfig)> = Vec::new();
+    let mut weak_candidates: Vec<(String, TeamConfig)> = Vec::new();
     let mut scanned=0usize;
     if let Ok(entries)=fs::read_dir(&team_root) {
         for entry in entries.flatten() {
@@ -90,9 +92,17 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
                 exact=Some((name,config));
                 break;
             }
+            // A folder alone is insufficient if Claude explicitly records a
+            // different leadSessionId (the failure in the Forgeboard run).
+            if name==expected_name && config.lead_session_id.is_empty() {
+                exact=Some((name,config));
+                break;
+            }
             if !created_during_run(&file,started_at) { continue; }
             if belongs_to_project(&config,project,claude_home) {
                 project_candidates.push((name,config));
+            } else if config.lead_session_id.is_empty() {
+                weak_candidates.push((name,config));
             }
         }
     }
@@ -107,6 +117,11 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
     } else if project_candidates.len()>1 {
         state.discovery=format!("{} new teams match project; ambiguous, not linked", project_candidates.len());
         None
+    } else if weak_candidates.len()==1 && session_subagents(claude_home,session_id).is_none() {
+        // An old-format config lacking a lead ID and cwd is only a hint.
+        // Display members as unverified, never claim a confirmed native team.
+        state.discovery="new team config found; session/project unverified".into();
+        weak_candidates.pop()
     } else {
         state.discovery=format!("no linked native team; {} config(s) scanned",scanned);
         None
@@ -126,23 +141,32 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
         if m.agent_type == "team-lead" { continue; }
         if m.name.is_empty() { continue; }
         state.agents.push(Agent { name: m.name, role: m.agent_type, session_id: m.session_id,
-            state: "TEAM MEMBER".into(), task: String::new() });
+            state: if state.verified || state.project_linked {"TEAM MEMBER"} else {"UNVERIFIED"}.into(),
+            task: String::new() });
     }
     let task_dir = claude_home.join("tasks").join(&team_name);
     if let Ok(entries) = fs::read_dir(&task_dir) {
-        for entry in entries.flatten() {
-            if entry.path().extension().and_then(|s|s.to_str()) != Some("json") { continue; }
-            if let Ok(text) = fs::read_to_string(entry.path()) {
+        // An agent can own several task files. Show the most live one
+        // (in_progress > pending > completed) regardless of directory order;
+        // sorted paths make ties deterministic.
+        let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        files.sort();
+        let mut shown = BTreeMap::<String, u8>::new();
+        for file in files {
+            if file.extension().and_then(|s|s.to_str()) != Some("json") { continue; }
+            if let Ok(text) = fs::read_to_string(&file) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                     if v.get("status").is_none() { continue; }
                     let status = value_as_text(v.get("status"));
                     let owner = value_as_text(v.get("owner"));
-                    if !owner.is_empty() {
+                    let (rank, label) = match status.as_str() {
+                        "in_progress" => (3, "WORKING"), "completed" => (1, "TASK COMPLETE"), _ => (2, "WAITING")
+                    };
+                    if !owner.is_empty() && rank >= shown.get(&owner).copied().unwrap_or(0) {
                         if let Some(a) = state.agents.iter_mut().find(|a| a.name == owner) {
                             a.task = value_as_text(v.get("subject"));
-                            a.state = match status.as_str() {
-                                "completed" => "TASK COMPLETE", "in_progress" => "WORKING", _ => "WAITING"
-                            }.into();
+                            a.state = label.into();
+                            shown.insert(owner, rank);
                         }
                     }
                 }
@@ -240,6 +264,38 @@ pub fn claude_home() -> PathBuf {
         fs::write(p.join("config.json"),r#"{"leadSessionId":"unrelated","members":[{"name":"other","agentType":"general-purpose"}]}"#).unwrap();
         let s=snapshot(&home,"our-session",Path::new("/some-project"),SystemTime::now()+Duration::from_secs(60));
         assert!(!s.detected);
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test] fn recent_unverified_team_is_labelled_as_such() {
+        let home=temp_fixture();
+        let p=home.join("teams").join("custom-team"); fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("config.json"),r#"{"members":[{"name":"explorer","agentType":"general-purpose"}]}"#).unwrap();
+        let s=snapshot(&home,"not-a-match",Path::new("/some-project"),SystemTime::now()-Duration::from_secs(60));
+        assert!(s.detected && !s.verified);
+        assert_eq!(s.agents[0].state,"UNVERIFIED");
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test] fn session_named_folder_without_lead_id_is_linked() {
+        let home=temp_fixture();
+        let p=home.join("teams").join("session-ab12cd34"); fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("config.json"),r#"{"members":[{"name":"coder"}]}"#).unwrap();
+        let s=snapshot(&home,"ab12cd34-0000-0000-0000-000000000000",Path::new("/some-project"),SystemTime::now()+Duration::from_secs(60));
+        assert!(s.detected && s.verified);
+        assert_eq!(s.agents[0].name,"coder");
+        fs::remove_dir_all(home).unwrap();
+    }
+    #[test] fn in_progress_task_wins_over_completed_in_any_file_order() {
+        let home=temp_fixture();
+        let p=home.join("teams").join("native"); fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("config.json"),r#"{"leadSessionId":"lead","members":[{"name":"coder"}]}"#).unwrap();
+        let tasks=home.join("tasks").join("native"); fs::create_dir_all(&tasks).unwrap();
+        // The live task sorts both before and after a completed one.
+        fs::write(tasks.join("1.json"),r#"{"status":"completed","owner":"coder","subject":"old"}"#).unwrap();
+        fs::write(tasks.join("2.json"),r#"{"status":"in_progress","owner":"coder","subject":"current"}"#).unwrap();
+        fs::write(tasks.join("3.json"),r#"{"status":"completed","owner":"coder","subject":"older"}"#).unwrap();
+        let s=snapshot(&home,"lead",Path::new("/some-project"),SystemTime::now());
+        assert_eq!(s.agents[0].state,"WORKING");
+        assert_eq!(s.agents[0].task,"current");
         fs::remove_dir_all(home).unwrap();
     }
     #[test] fn background_subagents_are_visible_but_not_native_team() {

@@ -119,7 +119,7 @@ fn add_usage(t:&mut Totals,usage:&Value,model:&str){
     t.context_latest=ctx;
     t.input+=input;t.output+=output;t.cache_read+=read;t.cache_write+=create;
     t.calls+=1;
-    if model.contains("opus") {t.opus_calls+=1;}
+    if model.contains("opus-5-5") {t.opus_calls+=1;}
     match pricing(model,input,output,create-write1,write1,read,ctx) {
         Some(usd)=>t.list_usd+=usd,
         None=>t.has_pricing_gap=true,
@@ -141,7 +141,18 @@ fn labelled_agent(path:&Path, names:&[String])->Option<String>{
     let filename=path.file_name()?.to_string_lossy();
     let id=filename.strip_prefix("agent-")?.strip_suffix(".jsonl")?;
     let meta=path.with_file_name(format!("agent-{}.meta.json",id));
-    recorded_name(&meta).filter(|name|names.contains(name))
+    if let Some(name)=recorded_name(&meta).filter(|name|names.contains(name)) {return Some(name);}
+    let file=fs::File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(12).flatten(){
+        if let Ok(v)=serde_json::from_str::<Value>(&line){
+            for key in ["agentName","agent_name","name"] {
+                if let Some(name)=v.get(key).and_then(Value::as_str) {
+                    if names.iter().any(|n|n==name){return Some(name.into());}
+                }
+            }
+        }
+    }
+    None
 }
 impl Telemetry {
     pub fn reset(&mut self) { *self=Self::default(); }
@@ -343,6 +354,23 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<Activity
     #[test]fn uses_opus_pricing_and_long_context_haiku(){
         assert!((pricing("claude-opus-5-5",1_000_000,1_000_000,0,0,0,100).unwrap()-24.0).abs()<0.001);
         assert!((pricing("claude-haiku-5-5",1_000_000,0,0,0,0,150_000).unwrap()-0.5).abs()<0.001);
+    }
+    #[test]fn names_worker_from_transcript_when_meta_is_missing(){
+        let dir=std::env::temp_dir().join(format!("telemetry-label-{}",uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let p=dir.join("agent-xyz.jsonl");
+        fs::write(&p,"{\"type\":\"user\",\"agentName\":\"coder-frontend\"}\n").unwrap();
+        let names=vec!["coder-frontend".to_string()];
+        assert_eq!(labelled_agent(&p,&names).as_deref(),Some("coder-frontend"));
+        assert_eq!(labelled_agent(&p,&["someone-else".to_string()]),None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]fn older_opus_teammate_is_not_counted_as_advisor_evidence(){
+        let mut t=Totals::default();
+        add_usage(&mut t,&serde_json::json!({"input_tokens":1,"output_tokens":1}),"claude-opus-4-1");
+        assert_eq!(t.opus_calls,0);
+        add_usage(&mut t,&serde_json::json!({"input_tokens":1,"output_tokens":1}),"claude-opus-5-5");
+        assert_eq!(t.opus_calls,1);
     }
     #[test]fn partial_line_is_retried(){
         let tmp=std::env::temp_dir().join(format!("telemetry-partial-{}.jsonl",uuid::Uuid::new_v4()));

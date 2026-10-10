@@ -147,6 +147,12 @@ pub fn cli_path() -> Result<PathBuf> {
         for filename in ["claude.exe", "claude.cmd", "claude.bat"] {
             let p = directory.join(filename);
             if !p.is_file() || exe.as_ref() == Some(&p) { continue; }
+            // Never launch Agentree's own legacy claude.cmd override.
+            if filename == "claude.cmd" {
+                if let Ok(contents) = std::fs::read_to_string(&p) {
+                    if contents.contains("CLAUDE_TREE_SHIM_DIR=") && contents.contains("claude-agent-tree.exe") { continue; }
+                }
+            }
             return Ok(p);
         }
     }
