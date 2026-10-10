@@ -9,6 +9,25 @@ use crate::team::TeamSnapshot;
 const CONTEXT_WINDOW: u64 = 1_000_000; // Haiku/Opus 5.5 published context window
 const MAX_EVENTS: usize = 36;
 
+/// Usage fields that at least one observed call did not report. The matching
+/// token sum counts only what was reported, so a missing field is never shown as zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Missing {
+    pub input: bool,
+    pub output: bool,
+    pub cache_read: bool,
+    pub cache_write: bool,
+    /// The 1h/5m cache-write split. It only moves cost between two rates.
+    pub cache_write_split: bool,
+}
+impl Missing {
+    fn any(self) -> bool { self.input || self.output || self.cache_read || self.cache_write || self.cache_write_split }
+    fn merge(&mut self, other: Missing) {
+        self.input |= other.input; self.output |= other.output;
+        self.cache_read |= other.cache_read; self.cache_write |= other.cache_write;
+        self.cache_write_split |= other.cache_write_split;
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct Totals {
     pub input: u64,
@@ -24,19 +43,22 @@ pub struct Totals {
     pub last_timestamp: String,
     pub has_pricing_gap: bool,
     pub opus_calls: u64,
+    pub missing: Missing,
 }
 impl Totals {
     pub fn tokens(&self) -> u64 { self.input + self.output + self.cache_read + self.cache_write }
     /// Runtime-neutral view. With no observed calls every field is Unknown, not zero.
-    /// A partial cost (an unpriced model was seen) is reported as Unknown.
+    /// A field that any observed call omitted is Unknown. Cost is Unknown when any
+    /// field is missing or an unpriced model was seen, because the estimate is then partial.
     pub fn usage(&self) -> model::Usage {
         if self.calls == 0 {return model::Usage::default();}
+        let measure = |missing: bool, value: u64| if missing {Measure::Unknown} else {Measure::Observed(value)};
         model::Usage {
-            input_tokens: Measure::Observed(self.input),
-            output_tokens: Measure::Observed(self.output),
-            cache_read_tokens: Measure::Observed(self.cache_read),
-            cache_write_tokens: Measure::Observed(self.cache_write),
-            cost_usd: if self.has_pricing_gap {Measure::Unknown} else {Measure::Observed(self.list_usd)},
+            input_tokens: measure(self.missing.input, self.input),
+            output_tokens: measure(self.missing.output, self.output),
+            cache_read_tokens: measure(self.missing.cache_read, self.cache_read),
+            cache_write_tokens: measure(self.missing.cache_write, self.cache_write),
+            cost_usd: if self.has_pricing_gap || self.missing.any() {Measure::Unknown} else {Measure::Observed(self.list_usd)},
         }
     }
     pub fn context_percent(&self) -> f64 { (self.context_latest as f64 * 100. / CONTEXT_WINDOW as f64).min(100.) }
@@ -47,6 +69,7 @@ impl Totals {
         self.list_usd += other.list_usd;
         self.has_pricing_gap |= other.has_pricing_gap;
         self.opus_calls += other.opus_calls;
+        self.missing.merge(other.missing);
     }
 }
 #[derive(Default)]
@@ -67,6 +90,14 @@ struct Trace {
     objective_complete: bool,
     advisor_completed_before_review: u64,
     advisor_usage_before_review: u64,
+    // Advisor evidence frozen at the verdict line. Calls after the verdict cannot justify it.
+    review_evidence: bool,
+}
+impl Trace {
+    /// Advisor result or usage observed since the review-start marker.
+    fn advisor_since_start(&self) -> bool {
+        self.advisor_completed>self.advisor_completed_before_review || self.advisor.calls>self.advisor_usage_before_review
+    }
 }
 #[derive(Clone,Debug,Default)]
 pub struct ReviewState {
@@ -79,11 +110,13 @@ pub struct ReviewState {
 }
 impl ReviewState {
     /// Final-review stage derived from run-scoped markers. Not started means Pending.
+    /// PASS is a lead claim. It maps to Passed only with advisor evidence observed
+    /// after the start marker; otherwise the stage stays Running.
     #[allow(dead_code)] // Consumed by the v0.6 run snapshot; covered by tests.
     pub fn stage(&self, run: &model::Id) -> model::Stage {
         use model::StageStatus::*;
         let status = match self.result.as_deref() {
-            Some("PASS") => Passed,
+            Some("PASS") if self.advisor_evidence => Passed,
             Some("NEEDS_CHANGES") => NeedsChanges,
             Some("BLOCKED") => Blocked,
             _ if self.started => Running,
@@ -109,16 +142,23 @@ pub struct Telemetry {
     pub review: ReviewState,
 }
 
-fn u64_field(v:&Value,k:&str)->u64 { v.get(k).and_then(Value::as_u64).unwrap_or(0) }
+fn u64_field(v:&Value,k:&str)->Option<u64> { v.get(k).and_then(Value::as_u64) }
 /// Tool name and a sanitised target label. Deliberately never renders arbitrary
 /// command lines or content, which could expose secrets to the dashboard.
 fn safe_tool(v:&Value) -> (String,String) {
     let name=v.get("name").and_then(Value::as_str).unwrap_or("Tool");
     let arg=v.get("input").unwrap_or(&Value::Null);
-    let target=["file_path","path","pattern","url"].iter()
-        .find_map(|k|arg.get(*k).and_then(Value::as_str))
-        .and_then(|p|p.rsplit(['/', '\\']).next()).unwrap_or("");
+    let target=["file_path","path","pattern","url"].iter().find_map(|k|{
+        let p=arg.get(*k).and_then(Value::as_str)?;
+        Some(if *k=="url" || p.contains("://") {url_host(p)} else {p.rsplit(['/', '\\']).next().unwrap_or("")})
+    }).unwrap_or("");
     (name.to_owned(), target.chars().take(38).collect())
+}
+/// Host and port of a URL only. Userinfo, path, query and fragment can all carry secrets.
+fn url_host(url:&str)->&str {
+    let rest=url.split_once("://").map_or(url,|(_,rest)|rest);
+    let authority=rest.split(['/','?','#']).next().unwrap_or("");
+    authority.rsplit('@').next().unwrap_or("")
 }
 /// Parses the `YYYY-MM-DDTHH:MM:SS[.fff]Z` form Claude writes into transcripts.
 /// Anything else (offsets, missing Z, out-of-range fields) is None, not a guess.
@@ -173,12 +213,17 @@ fn pricing(model:&str, input:u64, output:u64, cache5:u64, cache1:u64, read:u64, 
         + cache1 as f64*w1 + read as f64*r)/1_000_000.0)
 }
 fn add_usage(t:&mut Totals,usage:&Value,model:&str){
-    let input=u64_field(usage,"input_tokens");
-    let output=u64_field(usage,"output_tokens");
-    let read=u64_field(usage,"cache_read_input_tokens");
-    let create=u64_field(usage,"cache_creation_input_tokens");
+    let (input,output,read,create)=(u64_field(usage,"input_tokens"),u64_field(usage,"output_tokens"),
+        u64_field(usage,"cache_read_input_tokens"),u64_field(usage,"cache_creation_input_tokens"));
+    let write1_reported=u64_field(&usage["cache_creation"],"ephemeral_1h_input_tokens");
+    t.missing.input|=input.is_none();
+    t.missing.output|=output.is_none();
+    t.missing.cache_read|=read.is_none();
+    t.missing.cache_write|=create.is_none();
+    t.missing.cache_write_split|=write1_reported.is_none() && create.unwrap_or(0)>0;
+    let (input,output,read,create)=(input.unwrap_or(0),output.unwrap_or(0),read.unwrap_or(0),create.unwrap_or(0));
     // Whatever cache write is not itemised as 1h is priced at the 5m rate.
-    let write1=u64_field(&usage["cache_creation"],"ephemeral_1h_input_tokens").min(create);
+    let write1=write1_reported.unwrap_or(0).min(create);
     let ctx=input+read+create;
     t.context_latest=ctx;
     t.input+=input;t.output+=output;t.cache_read+=read;t.cache_write+=create;
@@ -280,8 +325,10 @@ impl Telemetry {
                 self.review.started=true;
                 self.review.objective_complete |= trace.objective_complete;
                 if trace.review_result.is_some(){self.review.result=trace.review_result.clone();}
-                self.review.advisor_evidence |= trace.advisor_completed>trace.advisor_completed_before_review
-                    || trace.advisor.calls>trace.advisor_usage_before_review;
+                self.review.advisor_evidence |= match trace.review_result {
+                    Some(_)=>trace.review_evidence,
+                    None=>trace.advisor_since_start(),
+                };
             }
             if trace.role=="unattributed"{self.unattributed_workers+=1;}
             if trace.totals.opus_calls>0 || trace.advisor_invocations>0 || trace.advisor.calls>0 {self.observed_opus=true;}
@@ -351,6 +398,7 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<model::E
                             trace.objective_complete=false;
                             trace.advisor_completed_before_review=trace.advisor_completed;
                             trace.advisor_usage_before_review=trace.advisor.calls;
+                            trace.review_evidence=false;
                             emit(events,&base,run_token,"Opus final review",None,at,EventKind::ReviewStarted);
                         }
                         if trace.review_started {
@@ -358,6 +406,7 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<model::E
                             if let Some(status)=line.strip_prefix(&prefix) {
                                 if ["PASS","NEEDS_CHANGES","BLOCKED"].contains(&status) {
                                     trace.review_result=Some(status.to_owned());
+                                    trace.review_evidence=trace.advisor_since_start();
                                 }
                             }
                             if line==format!("AGENTREE_OBJECTIVE_COMPLETE:{run_token}") {
@@ -479,6 +528,74 @@ fn consume_trace(path:&Path, trace:&mut Trace,role:&str,events:&mut Vec<model::E
         let stage=review.stage(&run);
         assert_eq!(stage.status,model::StageStatus::NeedsChanges);
         assert_eq!(stage.id.as_str(),"run-123/final-review");
+        // A PASS claim without observed advisor evidence is not Passed.
+        review.result=Some("PASS".into());
+        assert_eq!(review.stage(&run).status,model::StageStatus::Running);
+        review.advisor_evidence=true;
+        assert_eq!(review.stage(&run).status,model::StageStatus::Passed);
+    }
+    #[test]fn pass_without_observed_advisor_is_not_passed(){
+        let run=model::Id::new("run-123");
+        let root=std::env::temp_dir().join(format!("review-stage-{}",uuid::Uuid::new_v4()));
+        let p=root.join("projects").join("-F-Projects-agentree");
+        fs::create_dir_all(&p).unwrap();
+        let line=|id:&str,content:Value|serde_json::json!({"type":"assistant","timestamp":"2026-10-10T02:00:00Z","message":{
+            "id":id,"model":"claude-haiku-5-5","usage":{"input_tokens":1,"output_tokens":1},"content":content}}).to_string();
+        // refresh() scopes markers to the requested session ID, so the run token here is "lead".
+        let start=line("start",serde_json::json!([{"type":"text","text":"AGENTREE_REVIEW_START:lead"}]));
+        let verdict=line("finish",serde_json::json!([{"type":"text","text":"AGENTREE_REVIEW_RESULT:lead:PASS"}]));
+        let advice=line("review",serde_json::json!([
+            {"type":"server_tool_use","id":"srv_after","name":"advisor"},
+            {"type":"advisor_tool_result","tool_use_id":"srv_after"}]));
+        // Lead claims PASS with no advisor result after the marker.
+        fs::write(p.join("lead.jsonl"),format!("{start}\n{verdict}\n")).unwrap();
+        let mut claimed=Telemetry::default();
+        claimed.refresh(&root,"lead",&TeamSnapshot::default(),SystemTime::now());
+        assert_eq!(claimed.review.result.as_deref(),Some("PASS"));
+        assert!(!claimed.review.advisor_evidence);
+        assert_eq!(claimed.review.stage(&run).status,model::StageStatus::Running);
+        // The same PASS with an advisor result observed after the marker is Passed.
+        fs::write(p.join("lead.jsonl"),format!("{start}\n{advice}\n{verdict}\n")).unwrap();
+        let mut verified=Telemetry::default();
+        verified.refresh(&root,"lead",&TeamSnapshot::default(),SystemTime::now());
+        assert!(verified.review.advisor_evidence);
+        assert_eq!(verified.review.stage(&run).status,model::StageStatus::Passed);
+        // An advisor call after the verdict cannot justify a PASS that was claimed before it.
+        fs::write(p.join("lead.jsonl"),format!("{start}\n{verdict}\n{advice}\n")).unwrap();
+        let mut late=Telemetry::default();
+        late.refresh(&root,"lead",&TeamSnapshot::default(),SystemTime::now());
+        assert!(!late.review.advisor_evidence);
+        assert_eq!(late.review.stage(&run).status,model::StageStatus::Running);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]fn tool_targets_never_expose_url_secrets(){
+        let url=|u:&str|safe_tool(&serde_json::json!({"name":"WebFetch","input":{"url":u}})).1;
+        assert_eq!(url("https://user:pw@api.example.com:8443/v1/keys/abc123?token=SECRET&x=1#frag"),"api.example.com:8443");
+        assert_eq!(url("example.com/callback?code=SECRET"),"example.com");
+        assert_eq!(safe_tool(&serde_json::json!({"name":"Read","input":{"file_path":"C:/repo/src/main.rs"}})),("Read".into(),"main.rs".into()));
+        // A URL under any key is reduced to its host, not its basename.
+        assert_eq!(safe_tool(&serde_json::json!({"name":"Fetch","input":{"file_path":"https://h.example/x?sig=SECRET"}})),("Fetch".into(),"h.example".into()));
+    }
+    #[test]fn missing_usage_fields_are_unknown_not_zero(){
+        let mut t=Totals::default();
+        add_usage(&mut t,&serde_json::json!({"input_tokens":100,"output_tokens":10,
+            "cache_read_input_tokens":0,"cache_creation_input_tokens":0}),"claude-haiku-5-5");
+        let usage=t.usage();
+        assert_eq!(usage.input_tokens,Measure::Observed(100));
+        assert_eq!(usage.cache_read_tokens,Measure::Observed(0));
+        assert!(matches!(usage.cost_usd,Measure::Observed(_)));
+        // A later call that omits cache_read_input_tokens makes that field unknown, not observed zero.
+        add_usage(&mut t,&serde_json::json!({"input_tokens":5,"output_tokens":1,"cache_creation_input_tokens":0}),"claude-haiku-5-5");
+        let usage=t.usage();
+        assert_eq!(usage.input_tokens,Measure::Observed(105));
+        assert_eq!(usage.cache_read_tokens,Measure::Unknown);
+        assert_eq!(usage.cost_usd,Measure::Unknown);
+        // Cache writes without the 1h split leave the cost partial.
+        let mut split=Totals::default();
+        add_usage(&mut split,&serde_json::json!({"input_tokens":1,"output_tokens":1,
+            "cache_read_input_tokens":0,"cache_creation_input_tokens":20}),"claude-haiku-5-5");
+        assert_eq!(split.usage().cache_write_tokens,Measure::Observed(20));
+        assert_eq!(split.usage().cost_usd,Measure::Unknown);
     }
     #[test]fn uses_opus_pricing_and_long_context_haiku(){
         assert!((pricing("claude-opus-5-5",1_000_000,1_000_000,0,0,0,100).unwrap()-24.0).abs()<0.001);

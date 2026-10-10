@@ -8,6 +8,8 @@ pub struct Agent {
     pub role: String,
     pub session_id: String,
     pub state: String,
+    /// The task file's stem (its unique id within the team's task directory), empty when no task is recorded.
+    pub task_id: String,
     pub task: String,
 }
 #[derive(Default, Clone, Debug)]
@@ -38,7 +40,7 @@ impl TeamSnapshot {
     /// Tasks only where Claude recorded a status. Background subagents have none.
     #[allow(dead_code)] // Consumed by the v0.6 run snapshot; covered by tests.
     pub fn core_tasks(&self, run: &model::Id) -> Vec<model::Task> {
-        self.agents.iter().filter(|a| !a.task.is_empty()).filter_map(|a| {
+        self.agents.iter().filter(|a| !a.task.is_empty() && !a.task_id.is_empty()).filter_map(|a| {
             let status = match a.state.as_str() {
                 "WORKING" => TaskStatus::InProgress,
                 "WAITING" => TaskStatus::Pending,
@@ -46,7 +48,7 @@ impl TeamSnapshot {
                 _ => return None,
             };
             let agent_id = model::Id::new(format!("{run}/{}", a.name));
-            Some(model::Task { id: model::Id::new(format!("{agent_id}/task")), agent_id,
+            Some(model::Task { id: model::Id::new(format!("{run}/task/{}", a.task_id)), agent_id,
                 subject: a.task.clone(), status })
         }).collect()
     }
@@ -173,7 +175,7 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
         if m.name.is_empty() { continue; }
         state.agents.push(Agent { name: m.name, role: m.agent_type, session_id: m.session_id,
             state: if state.verified || state.project_linked {"TEAM MEMBER"} else {"UNVERIFIED"}.into(),
-            task: String::new() });
+            task_id: String::new(), task: String::new() });
     }
     let task_dir = claude_home.join("tasks").join(&team_name);
     if let Ok(entries) = fs::read_dir(&task_dir) {
@@ -195,6 +197,7 @@ pub fn snapshot(claude_home: &Path, session_id: &str, project: &Path,
                     };
                     if !owner.is_empty() && rank >= shown.get(&owner).copied().unwrap_or(0) {
                         if let Some(a) = state.agents.iter_mut().find(|a| a.name == owner) {
+                            a.task_id = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
                             a.task = value_as_text(v.get("subject"));
                             a.state = label.into();
                             shown.insert(owner, rank);
@@ -245,7 +248,7 @@ fn session_subagents(claude_home: &Path, session_id: &str) -> Option<TeamSnapsho
                 .is_some_and(|age|age < Duration::from_secs(30));
             let task = if description.is_empty() { "Delegated subagent task".into() } else { description };
             agents.insert(id.to_string(), Agent { name, role, session_id: String::new(),
-                state: if recent { "RECENT OUTPUT" } else { "RECORDED" }.into(), task });
+                state: if recent { "RECENT OUTPUT" } else { "RECORDED" }.into(), task_id: String::new(), task });
         }
     }
     if agents.is_empty() { return None; }
@@ -327,6 +330,7 @@ pub fn claude_home() -> PathBuf {
         let s=snapshot(&home,"lead",Path::new("/some-project"),SystemTime::now());
         assert_eq!(s.agents[0].state,"WORKING");
         assert_eq!(s.agents[0].task,"current");
+        assert_eq!(s.agents[0].task_id,"2");
         fs::remove_dir_all(home).unwrap();
     }
     #[test] fn background_subagents_are_visible_but_not_native_team() {
@@ -418,7 +422,7 @@ pub fn claude_home() -> PathBuf {
     #[test] fn core_agents_keep_provenance_and_tasks_keep_status() {
         let run = model::Id::new("run-1");
         let member = |state: &str, task: &str| Agent { name: "coder".into(), role: "general-purpose".into(),
-            state: state.into(), task: task.into(), ..Default::default() };
+            state: state.into(), task_id: "1".into(), task: task.into(), ..Default::default() };
         let mut verified = TeamSnapshot { detected: true, verified: true, team_name: "t".into(),
             agents: vec![member("WORKING", "Build UI")], ..Default::default() };
         assert_eq!(verified.core_agents(&run)[0].link, Link::NativeVerified);
@@ -438,6 +442,29 @@ pub fn claude_home() -> PathBuf {
         let background = TeamSnapshot { detected: true, agents: vec![member("RECENT OUTPUT", "Delegated")], ..Default::default() };
         assert_eq!(background.core_agents(&run)[0].link, Link::BackgroundSubagent);
         assert!(background.core_tasks(&run).is_empty(), "background status is not a task status");
+    }
+    #[test] fn core_task_ids_are_unique_and_follow_the_task_file() {
+        let run = model::Id::new("run-1");
+        let member = |name: &str, state: &str, task_id: &str, task: &str| Agent { name: name.into(),
+            role: "general-purpose".into(), state: state.into(), task_id: task_id.into(), task: task.into(),
+            ..Default::default() };
+        let mut s = TeamSnapshot { detected: true, team_name: "t".into(),
+            agents: vec![member("coder", "WORKING", "2", "Build UI"), member("reviewer", "WAITING", "3", "Review UI")],
+            ..Default::default() };
+        let tasks = s.core_tasks(&run);
+        assert_ne!(tasks[0].id.as_str(), tasks[1].id.as_str());
+        assert_eq!(tasks[0].id.as_str(), "run-1/task/2");
+        assert_eq!(tasks[1].id.as_str(), "run-1/task/3");
+        let again = s.core_tasks(&run);
+        assert_eq!(again[0].id.as_str(), "run-1/task/2");
+        assert_eq!(again[1].id.as_str(), "run-1/task/3");
+        s.agents[0].task_id = "4".into();
+        s.agents[0].task = "Build UI v2".into();
+        let moved = s.core_tasks(&run);
+        assert_eq!(moved[0].id.as_str(), "run-1/task/4");
+        assert_ne!(moved[0].id.as_str(), "run-1/task/2");
+        s.agents.push(member("explorer", "WORKING", "", "Scan repo"));
+        assert_eq!(s.core_tasks(&run).len(), 2, "a task without a file stem is not a task");
     }
 
 }

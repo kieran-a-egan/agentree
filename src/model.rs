@@ -178,9 +178,24 @@ pub struct Approval {
     pub resolved_at: Option<Timestamp>,
 }
 
+/// Rejects unknown schema versions rather than guessing.
+fn current_schema_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version == EVENT_SCHEMA_VERSION {
+        Ok(version)
+    } else {
+        Err(serde::de::Error::custom(format!(
+            "unsupported event schema_version {version}; this reader understands {EVENT_SCHEMA_VERSION}"
+        )))
+    }
+}
+
 /// Versioned envelope. Every event carries `schema_version`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Event {
+    #[serde(deserialize_with = "current_schema_version")]
     pub schema_version: u32,
     /// Unique within a run.
     pub id: Id,
@@ -296,6 +311,27 @@ mod tests {
         );
         let back: Event = serde_json::from_value(value).unwrap();
         assert_eq!(back, event);
+    }
+
+    #[test]
+    fn event_rejects_unknown_schema_version() {
+        let mut value = json!({
+            "schema_version": 1,
+            "id": "run-1@0#0",
+            "run_id": "run-1",
+            "agent_id": null,
+            "actor": "main",
+            "at": 1_781_000_000_000u64,
+            "kind": {"type": "tool_used", "tool": "Read", "target": "main.rs"}
+        });
+        assert!(serde_json::from_value::<Event>(value.clone()).is_ok());
+        for version in [2, 0] {
+            value["schema_version"] = json!(version);
+            assert!(serde_json::from_value::<Event>(value.clone()).is_err());
+        }
+        // A missing version is an error too, never a default.
+        value.as_object_mut().unwrap().remove("schema_version");
+        assert!(serde_json::from_value::<Event>(value).is_err());
     }
 
     #[test]
