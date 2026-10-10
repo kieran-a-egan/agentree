@@ -32,9 +32,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\uninstall-shim.ps1
 | `src/ui.rs` | Terminal layout, panes and activity highlights |
 | `src/pty.rs` | Native Claude subprocess and ConPTY integration |
 | `src/team.rs` | Native team discovery and shared-task status |
-| `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates |
+| `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
+| `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
 | `src/live.rs` | Observed terminal activity and review/completion signals |
 | `src/prompt.rs` | Team and escalation instructions given to Claude |
+
+The versioned event contract, including how unknown usage is represented, is documented in `docs/EVENT_SCHEMA.md`. Claude-specific parsing belongs in the adapters (`telemetry.rs`, `team.rs`); new dashboard code should consume `model` types rather than Claude file formats.
 
 Claude itself coordinates teammates and handles permissions. Agentree does **not** directly implement task scheduling or a JEV/System One reasoning router. Native team status comes from Claude's local team/task files. Background subagents are not presented as confirmed native teammates.
 
