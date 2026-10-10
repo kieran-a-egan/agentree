@@ -355,7 +355,10 @@ mod tests {
             .slave
             .spawn_command(cmd)
             .expect("start child under ConPTY");
-        assert!(child.process_id().is_some(), "ConPTY child has no process ID");
+        assert!(
+            child.process_id().is_some(),
+            "ConPTY child has no process ID"
+        );
         drop(pair.slave);
         child.kill().expect("terminate ConPTY child");
     }
