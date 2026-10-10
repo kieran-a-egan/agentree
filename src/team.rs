@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use crate::model::{self, Link, TaskStatus};
 use std::{collections::BTreeMap, fs, io::{BufRead, BufReader}, path::{Path, PathBuf}, time::{Duration, SystemTime}};
 
 #[derive(Default, Clone, Debug)]
@@ -19,6 +20,36 @@ pub struct TeamSnapshot {
     pub agents: Vec<Agent>,
     pub team_name: String,
     pub discovery: String,
+}
+impl TeamSnapshot {
+    /// Runtime-neutral agents. Provenance is taken from the snapshot's own flags;
+    /// an unverified or background worker is never reported as a native teammate.
+    #[allow(dead_code)] // Consumed by the v0.6 run snapshot; covered by tests.
+    pub fn core_agents(&self, run: &model::Id) -> Vec<model::Agent> {
+        let link = if self.team_name.is_empty() {Link::BackgroundSubagent}
+            else if self.verified {Link::NativeVerified}
+            else if self.project_linked {Link::NativeProjectLinked}
+            else {Link::Unverified};
+        self.agents.iter().map(|a| model::Agent {
+            id: model::Id::new(format!("{run}/{}", a.name)), run_id: run.clone(),
+            name: a.name.clone(), role: a.role.clone(), link,
+        }).collect()
+    }
+    /// Tasks only where Claude recorded a status. Background subagents have none.
+    #[allow(dead_code)] // Consumed by the v0.6 run snapshot; covered by tests.
+    pub fn core_tasks(&self, run: &model::Id) -> Vec<model::Task> {
+        self.agents.iter().filter(|a| !a.task.is_empty()).filter_map(|a| {
+            let status = match a.state.as_str() {
+                "WORKING" => TaskStatus::InProgress,
+                "WAITING" => TaskStatus::Pending,
+                "TASK COMPLETE" => TaskStatus::Completed,
+                _ => return None,
+            };
+            let agent_id = model::Id::new(format!("{run}/{}", a.name));
+            Some(model::Task { id: model::Id::new(format!("{agent_id}/task")), agent_id,
+                subject: a.task.clone(), status })
+        }).collect()
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all="camelCase")]
@@ -383,6 +414,30 @@ pub fn claude_home() -> PathBuf {
         assert!(!result.detected);
         assert!(result.discovery.contains("ambiguous"));
         fs::remove_dir_all(home).unwrap();
+    }
+    #[test] fn core_agents_keep_provenance_and_tasks_keep_status() {
+        let run = model::Id::new("run-1");
+        let member = |state: &str, task: &str| Agent { name: "coder".into(), role: "general-purpose".into(),
+            state: state.into(), task: task.into(), ..Default::default() };
+        let mut verified = TeamSnapshot { detected: true, verified: true, team_name: "t".into(),
+            agents: vec![member("WORKING", "Build UI")], ..Default::default() };
+        assert_eq!(verified.core_agents(&run)[0].link, Link::NativeVerified);
+        assert_eq!(verified.core_agents(&run)[0].id.as_str(), "run-1/coder");
+        assert_eq!(verified.core_tasks(&run)[0].status, TaskStatus::InProgress);
+        assert_eq!(verified.core_tasks(&run)[0].agent_id.as_str(), "run-1/coder");
+        verified.agents[0].state = "TASK COMPLETE".into();
+        assert_eq!(verified.core_tasks(&run)[0].status, TaskStatus::Completed);
+        verified.agents[0].state = "TEAM MEMBER".into();
+        assert!(verified.core_tasks(&run).is_empty(), "no recorded status means no task");
+        let linked = TeamSnapshot { detected: true, project_linked: true, team_name: "t".into(),
+            agents: vec![member("TEAM MEMBER", "")], ..Default::default() };
+        assert_eq!(linked.core_agents(&run)[0].link, Link::NativeProjectLinked);
+        let unverified = TeamSnapshot { detected: true, team_name: "t".into(),
+            agents: vec![member("UNVERIFIED", "")], ..Default::default() };
+        assert_eq!(unverified.core_agents(&run)[0].link, Link::Unverified);
+        let background = TeamSnapshot { detected: true, agents: vec![member("RECENT OUTPUT", "Delegated")], ..Default::default() };
+        assert_eq!(background.core_agents(&run)[0].link, Link::BackgroundSubagent);
+        assert!(background.core_tasks(&run).is_empty(), "background status is not a task status");
     }
 
 }

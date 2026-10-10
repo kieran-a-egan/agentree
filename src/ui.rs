@@ -1,4 +1,5 @@
 use crate::{App,Attention,Focus,Page};
+use crate::model::EventKind;
 use ratatui::{Frame, layout::{Constraint, Direction, Layout, Rect}, style::{Color,Modifier,Style},
     text::{Line,Span}, widgets::{Block,Borders,Paragraph,Wrap,Clear}};
 
@@ -328,15 +329,31 @@ fn review_strip(frame:&mut Frame,area:Rect,app:&App){
         glow_border(frame,area,OPUS,app.started.elapsed().as_millis()+400);
     }
 }
+/// UTC clock time of an event, or a placeholder when the source had no valid timestamp.
+fn clock(at:Option<u64>)->String {
+    match at {
+        Some(ms)=>{let s=(ms/1000)%86_400;format!("{:02}:{:02}:{:02}",s/3600,s/60%60,s%60)}
+        None=>"--:--:--".into(),
+    }
+}
+fn event_text(kind:&EventKind)->String {
+    match kind {
+        EventKind::ToolUsed{tool,target}=>if target.is_empty(){tool.clone()}else{format!("{tool} {target}")},
+        EventKind::AdvisorInvoked=>"Consultation invoked".into(),
+        EventKind::AdvisorCompleted=>"Consultation completed".into(),
+        EventKind::ReviewStarted=>"Review stage requested by lead".into(),
+        EventKind::ObjectiveCompleted=>"Objective marked complete".into(),
+    }
+}
 fn timeline(frame:&mut Frame,area:Rect,app:&App){
     let cap=area.height.saturating_sub(2) as usize;
     let rows:Vec<Line<'static>>=if app.telemetry.events.is_empty(){
         vec![accent("Waiting for tool activity in local Claude JSONL transcripts".into(),MUTED)]
     }else{app.telemetry.events.iter().rev().take(cap).collect::<Vec<_>>()
         .into_iter().rev().map(|e|Line::from(vec![
-            Span::styled(format!("{}  ",e.time),Style::default().fg(MUTED)),
-            Span::styled(format!("{:<16}",shorten(&e.who,15)),Style::default().fg(CYAN)),
-            Span::raw(shorten(&e.what,70)),
+            Span::styled(format!("{}  ",clock(e.at)),Style::default().fg(MUTED)),
+            Span::styled(format!("{:<16}",shorten(&e.actor,15)),Style::default().fg(CYAN)),
+            Span::raw(shorten(&event_text(&e.kind),70)),
         ])).collect()};
     paragraph(frame,area,"SESSION LOG / LIVE TOOL ACTIVITY",rows,MUTED);
 }
@@ -432,5 +449,13 @@ pub fn draw(frame:&mut Frame,app:&App){
             seen.insert((x,y));
         }
         assert_eq!(seen.len(),len);
+    }
+    #[test] fn timeline_wording_and_clock_match_the_event_contract() {
+        assert_eq!(clock(Some(1_791_594_000_000)),"01:00:00");
+        assert_eq!(clock(None),"--:--:--");
+        let tool=|target:&str|EventKind::ToolUsed{tool:"Read".into(),target:target.into()};
+        assert_eq!(event_text(&tool("main.rs")),"Read main.rs");
+        assert_eq!(event_text(&tool("")),"Read");
+        assert_eq!(event_text(&EventKind::AdvisorCompleted),"Consultation completed");
     }
 }

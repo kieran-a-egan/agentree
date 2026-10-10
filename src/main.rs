@@ -1,6 +1,10 @@
 mod team;
 mod telemetry;
 mod live;
+// Runtime-neutral contract (v0.5). Adapters translate Claude files into these
+// types; the dashboard should not parse Claude formats directly.
+#[allow(dead_code)] // Approval/Run/Stage have no runtime consumer until v0.6+; tests pin the wire format.
+mod model;
 mod prompt;
 mod pty;
 mod ui;
@@ -201,7 +205,7 @@ impl App {
                         got_data=true;
                     },
                     Ok(pty::PtyEvent::End(e))=>{self.output_end=true;self.message=e;break;},
-                    Err(_)=>{quiet=!got_data;break;},
+                    Err(_)=>{quiet = !got_data;break;},
                 }
             }
         }
@@ -368,8 +372,8 @@ impl App {
                 match key.code {
                     KeyCode::F(6)=>{self.focus=Focus::Native;self.terminal_expanded=false;self.dashboard_expanded=false;self.close_confirm=false;},
                     KeyCode::F(7) if self.attention.is_some()=>{self.focus=Focus::Response;},
-                    KeyCode::F(8)=>{self.terminal_expanded=!self.terminal_expanded; self.dashboard_expanded=false; self.focus=Focus::Native; self.message=if self.terminal_expanded {"Full Claude terminal; F8 returns to split view".into()}else{"Split dashboard restored".into()};},
-                    KeyCode::F(9)=>{self.dashboard_expanded=!self.dashboard_expanded; self.terminal_expanded=false; self.message=if self.dashboard_expanded {"Full Agent Tree; F9 returns to split view".into()}else{"Split dashboard restored".into()};},
+                    KeyCode::F(8)=>{self.terminal_expanded = !self.terminal_expanded; self.dashboard_expanded=false; self.focus=Focus::Native; self.message=if self.terminal_expanded {"Full Claude terminal; F8 returns to split view".into()}else{"Split dashboard restored".into()};},
+                    KeyCode::F(9)=>{self.dashboard_expanded = !self.dashboard_expanded; self.terminal_expanded=false; self.message=if self.dashboard_expanded {"Full Agent Tree; F9 returns to split view".into()}else{"Split dashboard restored".into()};},
                     KeyCode::F(4)=>{
                         if self.telemetry.review.objective_complete || self.live.objective_complete {
                             self.message="Objective completion already recorded; the clock is frozen.".into();
