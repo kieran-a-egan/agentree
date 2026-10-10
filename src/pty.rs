@@ -14,33 +14,41 @@ pub struct Session {
     query_tail: Vec<u8>,
 }
 
-impl Session {
-    // Forwarded terminal capability requests need real responses. vt100 renders
-    // escape sequences but is not an interactive terminal emulator by itself.
-    // ConPTY may intercept DA1 before it reaches this method, so this is only
-    // one part of the startup mitigation, not a guaranteed Claude workaround.
-    pub fn answer_terminal_queries(&mut self, bytes: &[u8]) {
-        let previous = self.query_tail.len();
-        let mut combined = std::mem::take(&mut self.query_tail);
-        combined.extend_from_slice(bytes);
-        let queries: &[(&[u8], &[u8])] = &[
-            (b"\x1b[>0q", b"\x1bP>|Agentree 0.3.5\x1b\\"), // XTVERSION
-            (b"\x1b[c", b"\x1b[?1;2c"),                 // Primary DA
-            (b"\x1b[0c", b"\x1b[?1;2c"),                // Primary DA variant
-            (b"\x1b[6n", b"\x1b[1;1R"),                 // Cursor position
-            (b"\x1b[5n", b"\x1b[0n"),                   // Device status
-        ];
-        for (query, reply) in queries {
-            for (index, window) in combined.windows(query.len()).enumerate() {
-                // A request already wholly in the preceding tail was answered
-                // in an earlier chunk and must not be answered again.
-                if index + query.len() <= previous || window != *query { continue; }
-                if self.writer.write_all(reply).and_then(|_| self.writer.flush()).is_ok() {
-                    self.handshake_responses += 1;
-                }
+// Keep the terminal handshake parser independent of the PTY and process.
+// In CI it can be exercised without a Claude subscription or interactive terminal.
+const TERMINAL_QUERIES: [(&[u8], &[u8]); 5] = [
+    (b"\x1b[>0q", b"\x1bP>|Agentree 0.3.5\x1b\\"), // XTVERSION
+    (b"\x1b[c", b"\x1b[?1;2c"),                 // Primary DA
+    (b"\x1b[0c", b"\x1b[?1;2c"),                // Primary DA variant
+    (b"\x1b[6n", b"\x1b[1;1R"),                 // Cursor position
+    (b"\x1b[5n", b"\x1b[0n"),                   // Device status
+];
+
+fn terminal_query_replies(tail: &mut Vec<u8>, bytes: &[u8]) -> Vec<&'static [u8]> {
+    let previous = tail.len();
+    let mut combined = std::mem::take(tail);
+    combined.extend_from_slice(bytes);
+    let mut replies = Vec::new();
+    for (query, reply) in TERMINAL_QUERIES {
+        for (index, window) in combined.windows(query.len()).enumerate() {
+            // Don't answer queries already wholly contained in the previous tail.
+            if index + query.len() > previous && window == query {
+                replies.push(reply);
             }
         }
-        self.query_tail = combined[combined.len().saturating_sub(16)..].to_vec();
+    }
+    tail.extend_from_slice(&combined[combined.len().saturating_sub(16)..]);
+    replies
+}
+
+impl Session {
+    // ConPTY may intercept DA1 itself; this is a best-effort second path.
+    pub fn answer_terminal_queries(&mut self, bytes: &[u8]) {
+        for reply in terminal_query_replies(&mut self.query_tail, bytes) {
+            if self.writer.write_all(reply).and_then(|_| self.writer.flush()).is_ok() {
+                self.handshake_responses += 1;
+            }
+        }
     }
 }
 
@@ -62,6 +70,24 @@ impl Drop for Session {
     }
 }
 
+// Exactly one native lead CLI is launched; teammates are created by Claude's
+// named Agent tool inside that interactive session, not by separate PTYs.
+const CLAUDE_TEAM_ENV: [(&str, &str); 2] = [
+    ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1"),
+    ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5"),
+];
+
+fn claude_launch_args(session_id: &str, policy: &Path, first_message: &str) -> Vec<OsString> {
+    vec![
+        "--model".into(), "claude-haiku-5-5".into(),
+        "--advisor".into(), "opus".into(),
+        "--teammate-mode".into(), "in-process".into(),
+        "--session-id".into(), session_id.into(),
+        "--append-system-prompt-file".into(), policy.as_os_str().to_os_string(),
+        first_message.into(),
+    ]
+}
+
 pub fn spawn(cli: &Path, project: &Path, session_id: &str, policy: &Path,
              first_message: &str, rows: u16, cols: u16) -> Result<Session> {
     if !cli.exists() { bail!("Claude CLI not found: {}. Re-run install.ps1.", cli.display()); }
@@ -72,14 +98,10 @@ pub fn spawn(cli: &Path, project: &Path, session_id: &str, policy: &Path,
     let backend = if prefix.is_empty() { "native" } else { "npm/node" }.to_string();
     let mut cmd = CommandBuilder::new(exe.as_os_str());
     cmd.args(prefix);
-    cmd.arg("--model"); cmd.arg("claude-haiku-5-5");
-    cmd.arg("--advisor"); cmd.arg("opus");
-    cmd.arg("--teammate-mode"); cmd.arg("in-process");
-    cmd.arg("--session-id"); cmd.arg(session_id);
-    cmd.arg("--append-system-prompt-file"); cmd.arg(policy.as_os_str());
-    cmd.arg(first_message);
-    cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
-    cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5");
+    cmd.args(claude_launch_args(session_id, policy, first_message));
+    for (name, value) in CLAUDE_TEAM_ENV {
+        cmd.env(name, value);
+    }
     cmd.cwd(project.as_os_str());
     let child = pair.slave.spawn_command(cmd).context("Launching interactive Claude Code in ConPTY")?;
     drop(pair.slave);
@@ -166,5 +188,67 @@ mod tests {
     fn invalid_cli_fails_without_spawn() {
         let bad = PathBuf::from("/this-file-should-not-exist/claude.cmd");
         assert!(real_cli_argv(&bad).is_err());
+    }
+
+    #[test]
+    fn native_launcher_preserves_objective_and_team_settings() {
+        let policy = Path::new("C:/project with spaces/agentree-policy.txt");
+        let objective = "Implement issue #5: & | > \"quoted\"; don't escape shell metacharacters";
+        let args = claude_launch_args("run-guid", policy, objective);
+        let values: Vec<String> = args.iter().map(|s| s.to_string_lossy().into_owned()).collect();
+        assert_eq!(values, vec![
+            "--model", "claude-haiku-5-5",
+            "--advisor", "opus",
+            "--teammate-mode", "in-process",
+            "--session-id", "run-guid",
+            "--append-system-prompt-file", "C:/project with spaces/agentree-policy.txt",
+            objective,
+        ]);
+        assert_eq!(CLAUDE_TEAM_ENV, [
+            ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1"),
+            ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5"),
+        ]);
+        // A direct executable path needs no shell or wrapper.
+        let direct = Path::new("C:/tools/claude.exe");
+        assert_eq!(real_cli_argv(direct).unwrap(), (direct.to_path_buf(), Vec::new()));
+    }
+
+    #[test]
+    fn handshake_detects_split_queries_without_replying_twice() {
+        let mut tail = Vec::new();
+        assert!(terminal_query_replies(&mut tail, b"begin\x1b[>0").is_empty());
+        assert_eq!(terminal_query_replies(&mut tail, b"q end"), vec![b"\x1bP>|Agentree 0.3.5\x1b\\".as_slice()]);
+        assert!(terminal_query_replies(&mut tail, b"hello").is_empty());
+        assert_eq!(terminal_query_replies(&mut tail, b"\x1b[6n\x1b[5n"), vec![b"\x1b[1;1R".as_slice(), b"\x1b[0n".as_slice()]);
+        assert!(terminal_query_replies(&mut tail, b"unrelated text").is_empty());
+    }
+
+    #[test]
+    fn handshake_handles_primary_device_attribute_variants() {
+        let mut tail = Vec::new();
+        assert_eq!(terminal_query_replies(&mut tail, b"\x1b[c\x1b[0c"),
+            vec![b"\x1b[?1;2c".as_slice(), b"\x1b[?1;2c".as_slice()]);
+        assert!(terminal_query_replies(&mut tail, b"").is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_can_start_and_reap_child_without_claude() {
+        use std::time::{Duration, Instant};
+        let pair = native_pty_system().openpty(PtySize {
+            rows: 8, cols: 60, pixel_width: 0, pixel_height: 0
+        }).expect("open Windows ConPTY");
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/D", "/C", "exit /B 0"]);
+        let mut child = pair.slave.spawn_command(cmd).expect("start child under ConPTY");
+        drop(pair.slave);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while child.try_wait().expect("poll ConPTY child").is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("ConPTY child did not exit within 15 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
