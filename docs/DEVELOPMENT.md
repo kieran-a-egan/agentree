@@ -24,6 +24,23 @@ To remove the installed command without affecting Claude Code:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\uninstall-shim.ps1
 ```
 
+## Continuous integration and regression coverage
+
+Pull requests to `main` and pushes to `main` run [Windows CI](../.github/workflows/windows-ci.yml) on `windows-latest` using stable Rust. The required checks are:
+
+```powershell
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
+.\target\release\claude-agent-tree.exe --version
+.\target\release\claude-agent-tree.exe --help
+```
+
+Use the checked-in `Cargo.lock`; dependency changes must update it intentionally. No Claude credentials or external API keys are installed on the CI runner. Tests cover the Rust contracts, Claude team association and non-interactive ConPTY/launcher invariants. In particular, the PTY tests exercise session arguments, native team environment settings, terminal response chunking, and on Windows the ability to create a ConPTY, launch a benign child process, and request its termination. Automatic subprocess exit and actual Claude terminal interaction require the manual smoke test. They do **not** constitute a live authenticated Claude Agent Teams integration test.
+
+Before merging a change to the launcher or terminal UI, additionally smoke-test **on a developer's Windows machine with Claude signed in**: launch `agentree`, start an objective, verify the terminal accepts input and permission prompts, observe a named teammate in the dashboard, and ensure review/completion markers and exit cleanup still work. GitHub CI can't validate those third-party interactive behaviours without live credentials.
+
 ## Components
 
 | Source | Purpose |

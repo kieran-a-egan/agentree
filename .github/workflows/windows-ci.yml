@@ -1,0 +1,61 @@
+name: Windows CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Rust validation (Windows)
+    runs-on: windows-latest
+    env:
+      RUST_BACKTRACE: '1'
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run unit and regression tests
+        run: cargo test --locked --all-targets -- --nocapture
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Smoke test native executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $PWD 'target\release\claude-agent-tree.exe'
+          if (!(Test-Path $exe)) { throw "Release EXE missing: $exe" }
+          $version = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^agentree\s+\d+\.\d+\.\d+') {
+            throw "Unexpected --version output: $version"
+          }
+          & $exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw '--help failed' }
