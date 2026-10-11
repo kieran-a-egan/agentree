@@ -51,6 +51,7 @@ Before merging a change to the launcher or terminal UI, additionally smoke-test 
 | `src/pty.rs` | Native Claude subprocess and ConPTY integration |
 | `src/capability.rs` | Claude Code capability matrix, launch-plan preflight and the flag probes behind them |
 | `src/roles.rs` | Per-role model settings: the Roles overlay options, validation, launch notes and the launch plan they produce |
+| `src/profiles.rs` | Saved profiles, per-project overrides, credential references and `roles.json` migration (`profiles.json`) |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
@@ -83,7 +84,7 @@ Opus advice and final-review requests are model-directed, not externally enforce
 
 ### Role settings
 
-`src/roles.rs` owns the per-role settings: the `Settings` that the Roles overlay edits and `roles.json` stores, the values each field can take, validation on load, the launch notes, and `Settings::plan()`, which builds the `RolePlan`. `capability.rs` owns `RolePlan` and `preflight`. The overlay, the file and the launch all read from `roles.rs`, so a saved choice is the one that launches.
+`src/roles.rs` owns the per-role settings: the `Settings` that the Roles overlay edits (one per profile in `profiles.json`), the values each field can take, validation on load, the launch notes, and `Settings::plan()`, which builds the `RolePlan`. `capability.rs` owns `RolePlan` and `preflight`. `profiles.rs` stores `Settings` per profile and resolves a project's effective `Settings`. The overlay, the file and the launch all read from those, so a saved choice is the one that launches.
 
 `roles::options(role, field)` is the single source of truth for the values a field can take. The overlay cycles through it, `Settings::sanitized` replaces any stored value outside it with the default, and `roles::applies` uses it to decide whether a field applies to a role. An empty slice means the field does not apply.
 
@@ -136,3 +137,9 @@ Run these on a Windows machine with Windows Terminal and Claude signed in, befor
 This is an executable Rust project, so commit the generated `Cargo.lock` for reproducible builds. Run `cargo generate-lockfile` on a machine with Cargo if it is not already present, and include it in the Git commit. Do not commit local Claude session logs, transcripts, credentials, `.env` files, or user projects.
 
 The package declares `MIT` in `Cargo.toml` and includes a matching `LICENSE` file. Review the licence choice before publishing.
+
+## Settings file
+
+`%LOCALAPPDATA%\ClaudeAgentTree\profiles.json` (format `version` 1) holds `active` (the global profile name), `profiles` (name to `{ roles, credentials }`, where `roles` has the shape of `roles::Settings`) and `projects` (a normalised folder key, from `profiles::project_key`, to an optional pinned `profile` and sparse per-role `roles` overrides). `Store::effective` resolves active profile, then pin, then overrides. Every value is checked against `roles::options` on load; unsupported values are replaced and reported. Credentials are `CredentialRef` values only. Writes go through a temporary file and a rename.
+
+`roles.json` is read once, by `profiles::load`, when `profiles.json` does not exist, and is never written. Under `cargo test` the data folder is a per-process temporary directory, so tests cannot touch real settings.

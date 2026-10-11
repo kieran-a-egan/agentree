@@ -32,14 +32,21 @@ Fix: run `claude update`, confirm `claude --version`, then press **F5** again. I
 
 ## Role settings
 
-**Reset a role:** open the Roles overlay with **F4** on the setup screen, select the role, and press **d**. This restores that role's defaults.
+**Reset a role:** open the Roles overlay with **F4** on the setup screen, select the role, and press **d**. This restores that role to its built-in values, or, in project scope (**s**), clears that role's overrides for the project.
 
-**Reset everything:** delete `%LOCALAPPDATA%\ClaudeAgentTree\roles.json`. A missing file means the defaults. The file is written again the next time you change a setting.
+**Reset everything:** close Agentree and delete `%LOCALAPPDATA%\ClaudeAgentTree\profiles.json`. The built-in profiles are used. If an old `roles.json` is still there it is migrated again, so delete it too for a clean start.
+
+**Which settings a run uses:** the overlay header names the profile in use and whether this project pins it. Project overrides are marked `*` and win over the profile. Choices made for one project do not affect others.
 
 **Warnings in the overlay:**
 
-- `<Role> <setting> '<value>' is not supported; using <default>.` The value in `roles.json` was edited by hand to one the overlay does not offer. Agentree uses the default for that setting. Choose the value again in the overlay, or fix the file.
-- `roles.json could not be read (...); using defaults.` The file exists but cannot be read or parsed. Agentree uses the defaults and leaves the file alone until you change a setting. Fix the JSON, or delete the file.
+- `Profile <name>: <Role> <setting> '<value>' is not supported; using <default>.` A value in `profiles.json` was edited by hand to one the overlay does not offer. Agentree uses the default for that setting. Choose the value again in the overlay, or fix the file.
+- `Project <path>: ... ignored.` or `... pins profile '<name>', which does not exist` A project's saved choice is no longer valid. It is ignored.
+- `Profile <name>: credential '<label>' is not a reference ... and was removed.` A credential must be `env:NAME` or `wincred:TARGET`. A plaintext value was refused and is not saved again.
+- `profiles.json could not be used (...)` The file is not valid JSON or comes from a newer Agentree. It was moved to `profiles.json.invalid` (or `.invalid.1`, and so on, if one exists) and the built-in profiles are used. Fix and rename it back, or keep working: the next change writes a new `profiles.json`.
+- `... could not be moved aside (...)` or `... could not be read (...)` Agentree could not preserve `%LOCALAPPDATA%\ClaudeAgentTree\profiles.json` (it is open in another program, or access is denied). The file was left unchanged and changes in this session are not saved. Close whatever holds it, or move or fix the file yourself, then restart Agentree.
+- `Your role settings from roles.json are now the Migrated profile.` One-time notice after upgrading. `roles.json` was left in place.
+- `roles.json could not be read (...)` The old file could not be parsed, so it was not migrated and was left untouched.
 
 **`NOT SUPPORTED` for Effort level or Permission modes (F7):** the installed Claude Code CLI rejects `--effort` or `--permission-mode`. The launch is blocked only when the lead's effort or permission mode is set to something other than default, because only then does the plan need the flag. Fix: run `claude update`, then press **F5** again, or set the lead's effort and permission mode back to default. Not verified in a live session.
 

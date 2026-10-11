@@ -8,7 +8,6 @@
 
 use crate::capability::{RolePlan, Teammate};
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path};
 
 /// Models Agentree can hand to Claude Code, as full names.
 pub const MODELS: [&str; 3] = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"];
@@ -60,6 +59,24 @@ impl Role {
             Role::Advisor => "Advisor",
             Role::FinalReviewer => "Final reviewer",
         }
+    }
+
+    /// Stable name used in saved files. Matches the `Settings` field names.
+    pub fn key(self) -> &'static str {
+        match self {
+            Role::Lead => "lead",
+            Role::Planner => "planner",
+            Role::Explorer => "explorer",
+            Role::Researcher => "researcher",
+            Role::Coder => "coder",
+            Role::Tester => "tester",
+            Role::Advisor => "advisor",
+            Role::FinalReviewer => "final_reviewer",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Role> {
+        ROLES.into_iter().find(|r| r.key() == key)
     }
 
     /// Named teammates that Claude spawns inside the lead's session.
@@ -120,7 +137,7 @@ pub struct Settings {
     pub final_reviewer: Setting,
 }
 
-fn default_setting(role: Role) -> Setting {
+pub(crate) fn default_setting(role: Role) -> Setting {
     match role {
         Role::Lead => Setting {
             model: MODELS[0].into(),
@@ -198,7 +215,7 @@ pub fn not_applicable_reason(role: Role, field: Field) -> &'static str {
     }
 }
 
-fn raw(setting: &Setting, field: Field) -> String {
+pub(crate) fn raw(setting: &Setting, field: Field) -> String {
     match field {
         Field::Model => setting.model.clone(),
         Field::Effort => setting.effort.clone(),
@@ -207,7 +224,7 @@ fn raw(setting: &Setting, field: Field) -> String {
     }
 }
 
-fn assign(setting: &mut Setting, field: Field, value: &str) {
+pub(crate) fn assign(setting: &mut Setting, field: Field, value: &str) {
     match field {
         Field::Model => setting.model = value.into(),
         Field::Effort => setting.effort = value.into(),
@@ -231,6 +248,11 @@ pub fn model_label(model: &str) -> &'static str {
 }
 
 impl Settings {
+    /// The stored value of one field as text, whether or not the field applies to the role.
+    pub fn value(&self, role: Role, field: Field) -> String {
+        raw(self.get(role), field)
+    }
+
     pub fn get(&self, role: Role) -> &Setting {
         match role {
             Role::Lead => &self.lead,
@@ -244,7 +266,7 @@ impl Settings {
         }
     }
 
-    fn get_mut(&mut self, role: Role) -> &mut Setting {
+    pub(crate) fn get_mut(&mut self, role: Role) -> &mut Setting {
         match role {
             Role::Lead => &mut self.lead,
             Role::Planner => &mut self.planner,
@@ -287,7 +309,7 @@ impl Settings {
     }
 
     /// Replaces any value that is not offered for its role with the default, and says so.
-    /// `roles.json` is hand-editable, so a stored value is never trusted as it is.
+    /// Saved files are hand-editable, so a stored value is never trusted as it is.
     pub fn sanitized(mut self) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         for role in ROLES {
@@ -363,37 +385,6 @@ impl Settings {
         }
         notes
     }
-}
-
-/// Loads `roles.json`. A missing file means the defaults. An unreadable file also means the
-/// defaults, with a warning that explains why, and is not overwritten until the user changes a setting.
-pub fn load(path: &Path) -> (Settings, Vec<String>) {
-    match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<Settings>(&text) {
-            Ok(settings) => settings.sanitized(),
-            Err(error) => (
-                Settings::default(),
-                vec![format!(
-                    "roles.json could not be read ({error}); using defaults."
-                )],
-            ),
-        },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => (Settings::default(), vec![]),
-        Err(error) => (
-            Settings::default(),
-            vec![format!(
-                "roles.json could not be read ({error}); using defaults."
-            )],
-        ),
-    }
-}
-
-pub fn save(path: &Path, settings: &Settings) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let json = serde_json::to_vec_pretty(settings).map_err(io::Error::other)?;
-    fs::write(path, json)
 }
 
 #[cfg(test)]
@@ -474,33 +465,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_corrupt_files_use_defaults_and_say_why() {
-        let dir = std::env::temp_dir().join(format!("agentree-roles-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("roles.json");
-        assert_eq!(load(&path), (Settings::default(), vec![]));
-
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(&path, "{ not json").unwrap();
-        let (settings, warnings) = load(&path);
-        assert_eq!(settings, Settings::default());
-        assert!(warnings[0].contains("could not be read"));
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn saved_settings_round_trip_and_partial_files_keep_defaults() {
-        let dir = std::env::temp_dir().join(format!("agentree-roles-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("roles.json");
-        let mut s = Settings::default();
-        s.cycle(Role::Lead, Field::Effort, 1);
-        save(&path, &s).unwrap();
-        assert_eq!(load(&path), (s, vec![]));
-
-        fs::write(&path, r#"{"lead":{"model":"claude-opus-5-5"}}"#).unwrap();
-        let (partial, warnings) = load(&path);
+    fn partial_files_keep_defaults_for_what_they_omit() {
+        let partial: Settings =
+            serde_json::from_str(r#"{"lead":{"model":"claude-opus-5-5"}}"#).unwrap();
+        let (partial, warnings) = partial.sanitized();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(partial.lead.model, MODELS[2]);
         assert_eq!(partial.coder, default_setting(Role::Coder));
-        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn role_keys_match_the_saved_field_names() {
+        let value = serde_json::to_value(Settings::default()).unwrap();
+        for role in ROLES {
+            assert!(value.get(role.key()).is_some(), "{}", role.key());
+            assert_eq!(Role::from_key(role.key()), Some(role));
+        }
+        assert_eq!(Role::from_key("nobody"), None);
     }
 }
