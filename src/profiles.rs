@@ -181,6 +181,10 @@ pub struct Store {
     pub active: String,
     pub profiles: BTreeMap<String, Profile>,
     pub projects: BTreeMap<String, ProjectEntry>,
+    /// Set when the file on disk was not preserved: it could not be moved aside or read.
+    /// `save` refuses while this is set, so the user's original file is never overwritten.
+    #[serde(skip)]
+    protected: Option<String>,
 }
 
 impl Default for Store {
@@ -203,6 +207,7 @@ impl Default for Store {
             active: DEFAULT_PROFILE.into(),
             profiles,
             projects: BTreeMap::new(),
+            protected: None,
         }
     }
 }
@@ -489,6 +494,9 @@ impl Store {
 
     /// Writes the file through a temporary one, so a crash cannot leave half a file behind.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(reason) = &self.protected {
+            return Err(io::Error::other(reason.clone()));
+        }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -499,46 +507,72 @@ impl Store {
     }
 }
 
-/// Moves an unusable file aside so the next save cannot destroy it.
-fn set_aside(path: &Path) -> PathBuf {
-    let mut aside = path.with_extension("json.invalid");
-    for n in 1..100 {
-        if !aside.exists() {
-            break;
-        }
-        aside = path.with_extension(format!("json.invalid.{n}"));
-    }
-    let _ = fs::rename(path, &aside);
-    aside
+/// Upper bound on numbered backups tried before giving up, so a broken directory cannot spin.
+const MAX_BACKUPS: u32 = 10_000;
+
+/// Moves an unusable file aside so the next save cannot destroy it. Returns the path it now
+/// lives at only when the move succeeded; an existing backup is never replaced.
+fn set_aside(path: &Path) -> io::Result<PathBuf> {
+    // Anything but a clear "not found" counts as taken, because `rename` replaces on Windows.
+    // ponytail: check-then-rename; only a third party writing here in between can race it.
+    // Use `hard_link` (fails if the name exists) then remove the original if that ever matters.
+    let free =
+        |p: &Path| matches!(fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    let base = path.with_extension("json.invalid");
+    let aside = std::iter::once(base)
+        .chain((1..=MAX_BACKUPS).map(|n| path.with_extension(format!("json.invalid.{n}"))))
+        .find(|p| free(p))
+        .ok_or_else(|| io::Error::other("no free backup name"))?;
+    fs::rename(path, &aside)?;
+    Ok(aside)
 }
 
 /// Loads `profiles.json`, migrating `legacy_roles` (the old `roles.json`) the first time.
 ///
 /// A file that cannot be used is moved to `profiles.json.invalid` and the built-in profiles are
-/// used, so nothing the user wrote is overwritten. `legacy_roles` is never modified.
+/// used, so nothing the user wrote is overwritten. If it cannot be moved (or read), the store
+/// refuses to save, so the original stays exactly as it was. `legacy_roles` is never modified.
 pub fn load(path: &Path, legacy_roles: &Path) -> (Store, Vec<String>) {
-    match fs::read_to_string(path) {
-        Ok(text) => match parse(&text) {
+    let shielded = |reason: String| Store {
+        protected: Some(reason),
+        ..Store::default()
+    };
+    match fs::read(path) {
+        Ok(bytes) => match String::from_utf8(bytes)
+            .map_err(|_| "it is not UTF-8 text".to_string())
+            .and_then(|text| parse(&text))
+        {
             Ok(store) => store.sanitized(),
-            Err(why) => {
-                let aside = set_aside(path);
-                (
+            Err(why) => match set_aside(path) {
+                Ok(aside) => (
                     Store::default(),
                     vec![format!(
                         "profiles.json could not be used ({why}); using the built-in profiles. \
                          The file was kept as {}.",
                         aside.display()
                     )],
-                )
-            }
+                ),
+                Err(error) => {
+                    let reason = format!(
+                        "{} could not be used ({why}) and could not be moved aside ({error}). \
+                         It was left unchanged and your changes will not be saved. Move or fix \
+                         it, then restart Agentree.",
+                        path.display()
+                    );
+                    (shielded(reason.clone()), vec![reason])
+                }
+            },
         },
         Err(error) if error.kind() == io::ErrorKind::NotFound => migrate(path, legacy_roles),
-        Err(error) => (
-            Store::default(),
-            vec![format!(
-                "profiles.json could not be read ({error}); using the built-in profiles."
-            )],
-        ),
+        Err(error) => {
+            let reason = format!(
+                "{} could not be read ({error}); using the built-in profiles. It was left \
+                 unchanged and your changes will not be saved. Fix access to it, then restart \
+                 Agentree.",
+                path.display()
+            );
+            (shielded(reason.clone()), vec![reason])
+        }
     }
 }
 
@@ -899,6 +933,119 @@ mod tests {
             assert_eq!(fs::read_to_string(&aside).unwrap(), bad);
             fs::remove_file(aside).unwrap();
         }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_non_utf8_file_is_kept_aside_like_any_other_invalid_file() {
+        let dir = temp();
+        let (path, legacy) = (dir.join("profiles.json"), dir.join("roles.json"));
+        let bytes = [0xFF, 0xFE, b'{', 0, b'}', 0]; // UTF-16 with a byte order mark
+        fs::write(&path, bytes).unwrap();
+        let (store, warnings) = load(&path, &legacy);
+        assert_eq!(store, Store::default());
+        assert!(warnings[0].contains("was kept as"), "{warnings:?}");
+        assert!(!path.exists());
+        assert_eq!(
+            fs::read(path.with_extension("json.invalid")).unwrap(),
+            bytes
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backups_never_replace_an_existing_one_however_many_exist() {
+        let dir = temp();
+        let (path, legacy) = (dir.join("profiles.json"), dir.join("roles.json"));
+        fs::write(path.with_extension("json.invalid"), "old").unwrap();
+        for n in 1..=150 {
+            fs::write(
+                path.with_extension(format!("json.invalid.{n}")),
+                format!("old{n}"),
+            )
+            .unwrap();
+        }
+        fs::write(&path, "{ not json").unwrap();
+        let (_, warnings) = load(&path, &legacy);
+        let kept = path.with_extension("json.invalid.151");
+        assert!(
+            warnings[0].contains(&kept.display().to_string()),
+            "{warnings:?}"
+        );
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "{ not json");
+        assert_eq!(
+            fs::read_to_string(path.with_extension("json.invalid")).unwrap(),
+            "old"
+        );
+        for n in 1..=150 {
+            let backup = path.with_extension(format!("json.invalid.{n}"));
+            assert_eq!(fs::read_to_string(backup).unwrap(), format!("old{n}"));
+        }
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_aside_reports_failure_instead_of_a_backup_path() {
+        let dir = temp();
+        let path = dir.join("profiles.json");
+        assert!(set_aside(&path).is_err());
+        assert!(!path.with_extension("json.invalid").exists());
+        fs::write(&path, "{ not json").unwrap();
+        assert_eq!(
+            set_aside(&path).unwrap(),
+            path.with_extension("json.invalid")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A reader that allows others to read but not to rename or delete, so the move fails while
+    /// the file stays readable (and invalid).
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_cannot_be_moved_aside_is_never_overwritten_by_later_edits() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp();
+        let (path, legacy) = (dir.join("profiles.json"), dir.join("roles.json"));
+        let original = r#"{"version": 2, "active": "Budget"}"#;
+        fs::write(&path, original).unwrap();
+        let hold = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1) // FILE_SHARE_READ only: no rename, no delete
+            .open(&path)
+            .unwrap();
+
+        let (mut store, warnings) = load(&path, &legacy);
+        assert!(
+            warnings[0].contains("could not be moved aside"),
+            "{warnings:?}"
+        );
+        assert!(!warnings[0].contains("was kept as"), "{warnings:?}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!path.with_extension("json.invalid").exists());
+
+        // The session still works in memory, but nothing is written over the original.
+        store.cycle_active(1);
+        let error = store.save(&path).unwrap_err().to_string();
+        assert!(error.contains("will not be saved"), "{error}");
+        drop(hold);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(store.save(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_not_overwritten() {
+        let dir = temp();
+        let (path, legacy) = (dir.join("profiles.json"), dir.join("roles.json"));
+        fs::create_dir(&path).unwrap(); // reading a directory fails with something but NotFound
+        let (store, warnings) = load(&path, &legacy);
+        assert!(warnings[0].contains("could not be read"), "{warnings:?}");
+        let error = store.save(&path).unwrap_err().to_string();
+        assert!(error.contains("will not be saved"), "{error}");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert!(path.is_dir());
         let _ = fs::remove_dir_all(dir);
     }
 

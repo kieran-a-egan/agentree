@@ -44,6 +44,7 @@ Fix: run `claude update`, confirm `claude --version`, then press **F5** again. I
 - `Project <path>: ... ignored.` or `... pins profile '<name>', which does not exist` A project's saved choice is no longer valid. It is ignored.
 - `Profile <name>: credential '<label>' is not a reference ... and was removed.` A credential must be `env:NAME` or `wincred:TARGET`. A plaintext value was refused and is not saved again.
 - `profiles.json could not be used (...)` The file is not valid JSON or comes from a newer Agentree. It was moved to `profiles.json.invalid` (or `.invalid.1`, and so on, if one exists) and the built-in profiles are used. Fix and rename it back, or keep working: the next change writes a new `profiles.json`.
+- `... could not be moved aside (...)` or `... could not be read (...)` Agentree could not preserve `%LOCALAPPDATA%\ClaudeAgentTree\profiles.json` (it is open in another program, or access is denied). The file was left unchanged and changes in this session are not saved. Close whatever holds it, or move or fix the file yourself, then restart Agentree.
 - `Your role settings from roles.json are now the Migrated profile.` One-time notice after upgrading. `roles.json` was left in place.
 - `roles.json could not be read (...)` The old file could not be parsed, so it was not migrated and was left untouched.
 

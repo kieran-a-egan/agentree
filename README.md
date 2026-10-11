@@ -126,7 +126,7 @@ A project can pin a different profile and override single fields over it. The se
 2. the profile pinned for the project, if any,
 3. the project's field overrides.
 
-Project choices are saved in `profiles.json` under the project's folder, not in the repository, so a cloned repository cannot change models or permission modes. In the overlay, a `*` after a role marks it as overridden for the current project.
+Project choices are saved in the same `profiles.json` under `%LOCALAPPDATA%\ClaudeAgentTree`, keyed by the project's folder. Nothing is written to the project directory or the repository, so a cloned repository cannot change models or permission modes. In the overlay, a `*` after a role marks it as overridden for the current project.
 
 | Key | Action |
 | --- | --- |
@@ -140,7 +140,7 @@ Project choices are saved in `profiles.json` under the project's folder, not in 
 
 ### Upgrading from `roles.json`
 
-The first time a version with profiles starts and finds a `roles.json`, its settings become the **Migrated** profile and it is made active, so a run is configured exactly as before. Unsupported values are replaced with defaults and listed in the overlay. `roles.json` is left in place and never written again. A `profiles.json` that cannot be read or comes from a newer Agentree is moved to `profiles.json.invalid` and the built-in profiles are used, so nothing you wrote is overwritten.
+The first time a version with profiles starts and finds a `roles.json`, its settings become the **Migrated** profile and it is made active, so a run is configured exactly as before. Unsupported values are replaced with defaults and listed in the overlay. `roles.json` is left in place and never written again. A `profiles.json` that is not valid or comes from a newer Agentree is moved to `profiles.json.invalid` (or `.invalid.1`, `.invalid.2`, and so on, never replacing an earlier backup) in `%LOCALAPPDATA%\ClaudeAgentTree`, and the built-in profiles are used. If the file cannot be moved aside or cannot be read, it is left exactly as it is, the overlay says so, and changes last only for that session and are not saved until you fix or move the file and restart.
 
 ### Credentials
 
