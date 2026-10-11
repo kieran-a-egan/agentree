@@ -362,4 +362,89 @@ mod tests {
         drop(pair.slave);
         child.kill().expect("terminate ConPTY child");
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_conpty_output_reaches_scrollback() {
+        use std::time::{Duration, Instant};
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 10,
+                cols: 60,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open Windows ConPTY");
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args([
+            "/D",
+            "/C",
+            "for /L %i in (1,1,200) do @echo agentree-line-%i",
+        ]);
+        let mut child = pair
+            .slave
+            .spawn_command(cmd)
+            .expect("start child under ConPTY");
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().expect("clone ConPTY reader");
+        let mut writer = pair.master.take_writer().expect("take ConPTY writer");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        // ConPTY blocks cmd until the terminal answers its cursor and attribute queries.
+        // Answer them the same way the app does, or the child never prints anything.
+        let mut query_tail = Vec::new();
+        let mut bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !String::from_utf8_lossy(&bytes).contains("agentree-line-200") {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(chunk) => {
+                    for reply in terminal_query_replies(&mut query_tail, &chunk) {
+                        let _ = writer.write_all(reply).and_then(|_| writer.flush());
+                    }
+                    bytes.extend(chunk);
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = child.kill();
+        drop(rx);
+        // Dropping a ConPTY master while its reader thread is blocked can hang on Windows,
+        // so the handle is leaked for this test's short lifetime instead.
+        std::mem::forget(pair.master);
+        let mut parser = vt100::Parser::new(10, 60, 2000);
+        parser.process(&bytes);
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert!(parser.screen().scrollback() > 0, "no scrollback history");
+        let rows: Vec<String> = (0..10u16)
+            .map(|y| {
+                (0..60u16)
+                    .map(|x| {
+                        parser
+                            .screen()
+                            .cell(y, x)
+                            .map(|c| c.contents().to_owned())
+                            .unwrap_or_default()
+                    })
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|row| row == "agentree-line-1"),
+            "first line not reachable in scrollback; rows:
+{}",
+            rows.join(
+                "
+"
+            )
+        );
+    }
 }

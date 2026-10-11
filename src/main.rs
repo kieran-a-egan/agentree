@@ -9,17 +9,22 @@ mod telemetry;
 mod model;
 mod prompt;
 mod pty;
+mod scroll;
 mod ui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use portable_pty::PtySize;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use scroll::{Move, Pane};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -95,6 +100,8 @@ fn path_input(s: &str) -> PathBuf {
     }
     PathBuf::from(s)
 }
+/// Lines of Claude terminal output kept for scrollback. Memory is bounded by this and the width.
+const HISTORY_LINES: usize = 2_000;
 /// How long the PTY queue must stay quiet after Claude exits before finishing.
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(300);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +118,8 @@ pub enum Focus {
     Objective,
     Native,
     Response,
+    /// Keys scroll and select dashboard panels; nothing is forwarded to Claude.
+    Dashboard,
 }
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
@@ -132,6 +141,8 @@ pub struct App {
     pub browser_entries: Vec<PathBuf>,
     pub browser_index: usize,
     pub issues: github::IssueBrowser,
+    /// Source of unique ids for GitHub lookups; a result must match the latest id to be applied.
+    issue_seq: u64,
     pub team: team::TeamSnapshot,
     pub telemetry: telemetry::Telemetry,
     pub agent_seen: HashMap<String, Instant>,
@@ -167,6 +178,13 @@ pub struct App {
     pub live: live::LiveSignals,
     /// New response/tool counters provide a bounded recent-activity pulse.
     pub activity: live::ActivityTracker,
+    /// Scroll position of every pane. The live terminal keeps its own history in `terminal`.
+    pub scrolls: scroll::Scrolls,
+    /// Which Issues-page pane Ctrl+scroll moves: the issue list or the preview.
+    pub issue_focus: Pane,
+    /// The dashboard panel Ctrl+scroll moves while Focus::Dashboard is set (F5 cycles it).
+    pub dash_focus: Pane,
+    pub help_open: bool,
 }
 impl App {
     fn new(args: Args) -> Self {
@@ -200,6 +218,7 @@ impl App {
             browser_entries: vec![],
             browser_index: 0,
             issues: Default::default(),
+            issue_seq: 0,
             team: Default::default(),
             telemetry: Default::default(),
             agent_seen: HashMap::new(),
@@ -208,7 +227,7 @@ impl App {
             session_id,
             attention: None,
             response: String::new(),
-            terminal: vt100::Parser::new(24, 80, 300),
+            terminal: vt100::Parser::new(24, 80, HISTORY_LINES),
             session: None,
             attention_file: run_dir.join("attention.json"),
             run_dir,
@@ -230,6 +249,10 @@ impl App {
             child_exited_at: None,
             live: Default::default(),
             activity: Default::default(),
+            scrolls: Default::default(),
+            issue_focus: Pane::Issues,
+            dash_focus: Pane::Timeline,
+            help_open: false,
         }
     }
     fn browser_open(&mut self) {
@@ -258,6 +281,7 @@ impl App {
             self.browser_entries.extend(sub);
         }
         self.browser_index = 0;
+        self.scrolls.get(Pane::Folders).reset();
     }
     fn open_issues(&mut self) {
         if !path_input(&self.project).is_dir() {
@@ -266,40 +290,80 @@ impl App {
         }
         self.issues = Default::default();
         self.issues.status = "Loading open issues from GitHub...".into();
+        self.issue_focus = Pane::Issues;
         self.page = Page::Issues;
         self.start_load(github::browse);
     }
-    /// Runs `gh` and `git` off the UI thread. Replacing `issues.rx` drops any earlier, stale load.
+    /// The project folder a lookup is keyed to. Matches the path `start_load` hands to `gh` and `git`.
+    fn project_key(&self) -> String {
+        path_input(&self.project).display().to_string()
+    }
+    /// Starts a new lookup. Replacing `issues.rx` drops any earlier one, so its result can never arrive.
+    fn begin_lookup(&mut self) -> (github::Ticket, mpsc::Sender<github::Lookup>) {
+        self.issue_seq += 1;
+        let ticket = github::Ticket {
+            id: self.issue_seq,
+            project: self.project_key(),
+        };
+        let (tx, rx) = mpsc::channel();
+        self.issues.rx = Some(rx);
+        self.issues.loading = true;
+        self.issues.ticket = Some(ticket.clone());
+        (ticket, tx)
+    }
+    /// Discards the in-flight lookup, if any. Its late result is never applied.
+    fn cancel_lookup(&mut self) {
+        self.issues.rx = None;
+        self.issues.loading = false;
+        self.issues.ticket = None;
+    }
+    /// A lookup for another project must not outlive the edit that changed the project.
+    fn reconcile_lookup(&mut self) {
+        let stale = self
+            .issues
+            .ticket
+            .as_ref()
+            .is_some_and(|t| t.project != self.project_key());
+        if stale {
+            self.cancel_lookup();
+            self.message = "Project changed; the GitHub issue lookup was cancelled.".into();
+        }
+    }
+    /// Runs `gh` and `git` off the UI thread.
     fn start_load<F>(&mut self, load: F)
     where
         F: FnOnce(&Path) -> Result<github::Loaded, github::Error> + Send + 'static,
     {
         let project = path_input(&self.project);
-        let (tx, rx) = mpsc::channel();
+        let (ticket, tx) = self.begin_lookup();
         thread::spawn(move || {
-            let _ = tx.send(load(&project));
+            let _ = tx.send(github::Lookup {
+                ticket,
+                result: load(&project),
+            });
         });
-        self.issues.rx = Some(rx);
-        self.issues.loading = true;
     }
     fn poll_issues(&mut self) {
+        self.reconcile_lookup();
         let received = match self.issues.rx.as_ref() {
             Some(rx) => rx.try_recv(),
             None => return,
         };
-        let result = match received {
+        let lookup = match received {
             Err(TryRecvError::Empty) => return,
-            Ok(result) => result,
+            Ok(lookup) => lookup,
             Err(TryRecvError::Disconnected) => {
-                self.issues.rx = None;
-                self.issues.loading = false;
+                self.cancel_lookup();
                 self.issues.status = "The GitHub lookup stopped unexpectedly.".into();
                 return;
             }
         };
-        self.issues.rx = None;
-        self.issues.loading = false;
-        match result {
+        // Accept only the current ticket. Project changes were reconciled above, so the project matches.
+        if self.issues.ticket.as_ref() != Some(&lookup.ticket) {
+            return;
+        }
+        self.cancel_lookup();
+        match lookup.result {
             Ok(github::Loaded::Browse { repo, issues }) => {
                 self.issues.status = if issues.is_empty() {
                     format!("No open issues in {}.", repo.slug())
@@ -315,6 +379,8 @@ impl App {
                 self.issues.repo = Some(repo);
                 self.issues.issues = issues;
                 self.issues.index = 0;
+                self.scrolls.get(Pane::Issues).reset();
+                self.scrolls.get(Pane::Preview).reset();
             }
             Ok(github::Loaded::Single { repo, issue }) => {
                 if self.objective.trim().is_empty() {
@@ -341,6 +407,8 @@ impl App {
         let replaced = !self.objective.trim().is_empty();
         self.objective = github::objective_from_issue(repo, issue);
         self.focus = Focus::Objective;
+        // Open at the top so the whole GitHub-generated objective can be reviewed.
+        self.scrolls.get(Pane::Objective).reset();
         self.message = format!(
             "Objective from {}#{}{}. Review or edit it, then press F5 to start.",
             repo.slug(),
@@ -389,7 +457,8 @@ impl App {
         self.dashboard_expanded = false;
         let (rows, cols) = ui::native_dimensions(area, self.terminal_expanded);
         self.terminal_size = (rows, cols);
-        self.terminal = vt100::Parser::new(rows, cols, 400);
+        self.terminal = vt100::Parser::new(rows, cols, HISTORY_LINES);
+        self.scrolls = Default::default();
         self.started = Instant::now();
         self.finished_elapsed = None;
         self.clock_paused_manually = false;
@@ -416,8 +485,7 @@ impl App {
         self.page = Page::Running;
         self.focus = Focus::Native;
         // A late --issue or picker result must not overwrite the running session's status.
-        self.issues.rx = None;
-        self.issues.loading = false;
+        self.cancel_lookup();
         self.terminal_expanded = false;
         self.output_end = false;
         self.close_confirm = false;
@@ -433,6 +501,7 @@ impl App {
         self.child_exited_at = None;
         self.live = Default::default();
         self.activity = Default::default();
+        self.help_open = false;
         Ok(())
     }
     fn poll(&mut self, area: ratatui::layout::Rect) {
@@ -443,7 +512,7 @@ impl App {
         let (rows, cols) = ui::native_dimensions(area, self.terminal_expanded);
         if self.terminal_size != (rows, cols) {
             self.terminal_size = (rows, cols);
-            self.terminal.set_size(rows, cols);
+            self.terminal.screen_mut().set_size(rows, cols);
             if let Some(s) = &mut self.session {
                 let _ = s.master.resize(PtySize {
                     rows,
@@ -483,7 +552,7 @@ impl App {
             // Claude's terminal renders status before its JSONL transcripts
             // are flushed. Observe *visible* signals on every poll that
             // brought PTY output, not only after a session ends.
-            let screen = self.terminal.screen().contents();
+            let screen = self.live_text();
             self.live.observe_screen(&screen, &self.session_id);
             self.native_screen_visible =
                 self.native_screen_visible || screen.chars().any(|c| !c.is_whitespace());
@@ -560,6 +629,7 @@ impl App {
                     {
                         self.focus = Focus::Response;
                         self.response = String::new();
+                        self.scrolls.get(Pane::Attention).reset();
                     }
                     if !a.question.is_empty() {
                         self.attention = Some(a);
@@ -615,7 +685,13 @@ impl App {
             .copied()
             .or_else(|| self.agent_seen.get(name).map(Instant::elapsed))
     }
+    /// Sends a user's keystrokes or answer to Claude. Typing is an explicit request for the live
+    /// screen, so the reader returns to it. Output that arrives meanwhile is not lost.
     fn send(&mut self, input: &[u8]) -> bool {
+        self.terminal.screen_mut().set_scrollback(0);
+        self.write_input(input)
+    }
+    fn write_input(&mut self, input: &[u8]) -> bool {
         if let Some(s) = &mut self.session {
             if let Err(e) = s.writer.write_all(input).and_then(|_| s.writer.flush()) {
                 self.message = format!("Claude terminal input failed: {}", e);
@@ -626,11 +702,130 @@ impl App {
         self.message = "No running Claude terminal is available".into();
         false
     }
+    /// Live terminal history is vt100's; every other pane's offset lives in `scrolls`.
+    fn live_text(&mut self) -> String {
+        let back = self.terminal.screen().scrollback();
+        self.terminal.screen_mut().set_scrollback(0);
+        let text = self.terminal.screen().contents();
+        self.terminal.screen_mut().set_scrollback(back);
+        text
+    }
+    /// Moves the Claude terminal's history view. Offset 0 is the live screen.
+    fn scroll_terminal(&mut self, m: Move) {
+        if self.terminal.screen().alternate_screen() {
+            self.message =
+                "Fullscreen Claude has no scrollback; use the wheel or Claude's keys.".into();
+            return;
+        }
+        let back = self.terminal.screen().scrollback();
+        self.terminal.screen_mut().set_scrollback(usize::MAX);
+        let history = self.terminal.screen().scrollback();
+        let top = history.saturating_sub(back);
+        let next = scroll::target(m, top, history, self.terminal_size.0 as usize);
+        self.terminal.screen_mut().set_scrollback(history - next);
+    }
+    /// The wheel over the terminal either scrolls its history, or, when fullscreen Claude asked
+    /// for mouse input, passes the notch through so Claude scrolls its own view.
+    fn terminal_wheel(&mut self, up: bool, column: u16, row: u16, pane: ratatui::layout::Rect) {
+        let (alternate, mouse_on, sgr) = {
+            let s = self.terminal.screen();
+            (
+                s.alternate_screen(),
+                s.mouse_protocol_mode() != vt100::MouseProtocolMode::None,
+                s.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr,
+            )
+        };
+        if !(alternate && mouse_on) {
+            let lines = if up {
+                -scroll::WHEEL_LINES
+            } else {
+                scroll::WHEEL_LINES
+            };
+            self.scroll_terminal(Move::Lines(lines));
+            return;
+        }
+        let button: u8 = if up { 64 } else { 65 };
+        let x = column.saturating_sub(pane.x) + 1;
+        let y = row.saturating_sub(pane.y) + 1;
+        let bytes = if sgr {
+            format!("[<{button};{x};{y}M").into_bytes()
+        } else if x <= 222 && y <= 222 {
+            vec![0x1b, b'[', b'M', 32 + button, 32 + x as u8, 32 + y as u8]
+        } else {
+            return;
+        };
+        self.write_input(&bytes);
+    }
+    /// Mouse wheel scrolls the pane under the pointer. It never changes focus or selection.
+    pub fn wheel(&mut self, up: bool, column: u16, row: u16, area: ratatui::layout::Rect) {
+        let Some((pane, rect)) = ui::pane_at(area, self, column, row) else {
+            return;
+        };
+        if pane == Pane::Terminal {
+            self.terminal_wheel(up, column, row, rect);
+            return;
+        }
+        let lines = if up {
+            -scroll::WHEEL_LINES
+        } else {
+            scroll::WHEEL_LINES
+        };
+        self.scrolls.get(pane).apply(Move::Lines(lines));
+    }
+    /// The pane that Ctrl+scroll moves. It follows keyboard focus on each page.
+    fn focused_pane(&self) -> Pane {
+        match self.page {
+            Page::Setup if self.focus == Focus::Objective => Pane::Objective,
+            Page::Setup => Pane::Project,
+            Page::Browser => Pane::Folders,
+            Page::Issues => self.issue_focus,
+            Page::Running | Page::Finished => match self.focus {
+                Focus::Response => Pane::Attention,
+                Focus::Dashboard => self.dash_focus,
+                _ => Pane::Terminal,
+            },
+        }
+    }
+    fn scroll_focused(&mut self, m: Move) {
+        let pane = if self.help_open {
+            Pane::Help
+        } else {
+            self.focused_pane()
+        };
+        if pane == Pane::Terminal {
+            self.scroll_terminal(m);
+        } else {
+            self.scrolls.get(pane).apply(m);
+        }
+    }
+    /// Up/Down move the selection and keep it on screen. Otherwise the list's scroll position is kept.
+    fn move_issue(&mut self, delta: isize) {
+        self.issues.move_by(delta);
+        self.scrolls.get(Pane::Issues).reveal(self.issues.index);
+    }
     fn handle(&mut self, key: KeyEvent, area: ratatui::layout::Rect) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // F1 opens the controls panel on every page. While it is open, keys never reach Claude.
+        if key.code == KeyCode::F(1) {
+            self.help_open = !self.help_open;
+            return false;
+        }
+        if self.help_open {
+            if key.code == KeyCode::Esc {
+                self.help_open = false;
+            } else if let Some(m) = scroll::key_move(key) {
+                self.scrolls.get(Pane::Help).apply(m);
+            }
+            return false;
+        }
+        // Ctrl+scroll is handled before any page or Claude sees it.
+        if let Some(m) = scroll::key_move(key) {
+            self.scroll_focused(m);
+            return false;
+        }
         match self.page {
             Page::Setup => {
                 // Ctrl+L clears the entire multiline objective from either setup field.
@@ -638,6 +833,7 @@ impl App {
                 if ctrl && matches!(key.code, KeyCode::Char('l' | 'L')) {
                     self.objective.clear();
                     self.focus = Focus::Objective;
+                    self.scrolls.get(Pane::Objective).reset();
                     let mut prefs = read_prefs();
                     prefs.last_objective.clear();
                     save_prefs(&prefs);
@@ -682,14 +878,19 @@ impl App {
                             self.project.pop();
                         } else {
                             self.objective.pop();
+                            self.scrolls.get(Pane::Objective).pin_end();
                         }
                     }
-                    KeyCode::Enter if self.focus == Focus::Objective => self.objective.push('\n'),
+                    KeyCode::Enter if self.focus == Focus::Objective => {
+                        self.objective.push('\n');
+                        self.scrolls.get(Pane::Objective).pin_end();
+                    }
                     KeyCode::Char(c) if !ctrl => {
                         if self.focus == Focus::Project {
                             self.project.push(c);
                         } else {
                             self.objective.push(c);
+                            self.scrolls.get(Pane::Objective).pin_end();
                         }
                     }
                     _ => (),
@@ -697,10 +898,14 @@ impl App {
             }
             Page::Browser => match key.code {
                 KeyCode::Esc => self.page = Page::Setup,
-                KeyCode::Up => self.browser_index = self.browser_index.saturating_sub(1),
+                KeyCode::Up => {
+                    self.browser_index = self.browser_index.saturating_sub(1);
+                    self.scrolls.get(Pane::Folders).reveal(self.browser_index);
+                }
                 KeyCode::Down => {
                     self.browser_index =
-                        (self.browser_index + 1).min(self.browser_entries.len().saturating_sub(1))
+                        (self.browser_index + 1).min(self.browser_entries.len().saturating_sub(1));
+                    self.scrolls.get(Pane::Folders).reveal(self.browser_index);
                 }
                 KeyCode::Enter => {
                     if let Some(p) = self.browser_entries.get(self.browser_index).cloned() {
@@ -716,38 +921,54 @@ impl App {
                 }
                 _ => (),
             },
-            Page::Issues => match key.code {
-                KeyCode::Esc => {
-                    self.issues.rx = None;
-                    self.issues.loading = false;
-                    self.page = Page::Setup;
-                    self.message = "Issue selection cancelled. The objective is unchanged.".into();
-                }
-                KeyCode::Enter => {
-                    if let (Some(repo), Some(issue)) =
-                        (self.issues.repo.clone(), self.issues.selected().cloned())
-                    {
-                        self.adopt_issue(&repo, &issue);
+            Page::Issues => {
+                let before = self.issues.selected().map(|i| i.number);
+                match key.code {
+                    KeyCode::Esc => {
+                        self.cancel_lookup();
                         self.page = Page::Setup;
+                        self.message =
+                            "Issue selection cancelled. The objective is unchanged.".into();
                     }
+                    KeyCode::Enter => {
+                        if let (Some(repo), Some(issue)) =
+                            (self.issues.repo.clone(), self.issues.selected().cloned())
+                        {
+                            self.adopt_issue(&repo, &issue);
+                            self.page = Page::Setup;
+                        }
+                    }
+                    KeyCode::Tab => {
+                        self.issue_focus = if self.issue_focus == Pane::Issues {
+                            Pane::Preview
+                        } else {
+                            Pane::Issues
+                        };
+                    }
+                    KeyCode::Up => self.move_issue(-1),
+                    KeyCode::Down => self.move_issue(1),
+                    KeyCode::PageUp => self.move_issue(-10),
+                    KeyCode::PageDown => self.move_issue(10),
+                    KeyCode::Char('r' | 'R') if ctrl => self.open_issues(),
+                    KeyCode::Backspace => {
+                        let mut filter = self.issues.filter.clone();
+                        filter.pop();
+                        self.issues.set_filter(filter);
+                        self.scrolls.get(Pane::Issues).reset();
+                    }
+                    KeyCode::Char(c) if !ctrl => {
+                        let mut filter = self.issues.filter.clone();
+                        filter.push(c);
+                        self.issues.set_filter(filter);
+                        self.scrolls.get(Pane::Issues).reset();
+                    }
+                    _ => (),
                 }
-                KeyCode::Up => self.issues.move_by(-1),
-                KeyCode::Down => self.issues.move_by(1),
-                KeyCode::PageUp => self.issues.move_by(-10),
-                KeyCode::PageDown => self.issues.move_by(10),
-                KeyCode::Char('r' | 'R') if ctrl => self.open_issues(),
-                KeyCode::Backspace => {
-                    let mut filter = self.issues.filter.clone();
-                    filter.pop();
-                    self.issues.set_filter(filter);
+                // A different issue starts its preview at the top. The same issue keeps its place.
+                if self.issues.selected().map(|i| i.number) != before {
+                    self.scrolls.get(Pane::Preview).reset();
                 }
-                KeyCode::Char(c) if !ctrl => {
-                    let mut filter = self.issues.filter.clone();
-                    filter.push(c);
-                    self.issues.set_filter(filter);
-                }
-                _ => (),
-            },
+            }
             Page::Running => {
                 match key.code {
                     KeyCode::F(6) => {
@@ -804,6 +1025,22 @@ impl App {
                         self.message =
                             "Claude is still running. Finish or /exit before returning to setup."
                                 .into();
+                    }
+                    // F5 moves dashboard focus. The first press focuses the current panel, then it cycles.
+                    KeyCode::F(5) => {
+                        if self.focus == Focus::Dashboard {
+                            let at = Pane::DASHBOARD
+                                .iter()
+                                .position(|p| *p == self.dash_focus)
+                                .unwrap_or(0);
+                            self.dash_focus = Pane::DASHBOARD[(at + 1) % Pane::DASHBOARD.len()];
+                        }
+                        self.focus = Focus::Dashboard;
+                        self.terminal_expanded = false;
+                        self.message = format!(
+                            "Dashboard panel {:?}. Ctrl+Up/Down scroll it; F6 returns to Claude.",
+                            self.dash_focus
+                        );
                     }
                     KeyCode::Char('q') if ctrl => {
                         if self.close_confirm {
@@ -898,7 +1135,7 @@ struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 fn dashboard(args: Args) -> Result<()> {
@@ -910,16 +1147,29 @@ fn dashboard(args: Args) -> Result<()> {
     enable_raw_mode().context("Switching terminal to raw input")?;
     let _reset = Reset;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    // Mouse capture is enabled after the alternate screen and disabled by `Reset` before leaving it.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    loop {
+    'frames: loop {
         let dim = terminal.size()?;
         let rect = ratatui::layout::Rect::new(0, 0, dim.width, dim.height);
         app.poll(rect);
         terminal.draw(|f| ui::draw(f, &app))?;
-        if event::poll(Duration::from_millis(80))? {
+        // Wait up to one frame for input, then take what queued meanwhile. Mouse movement
+        // is dense on Windows, so this stops it delaying keystrokes by a frame each.
+        let mut wait = Duration::from_millis(80);
+        for _ in 0..256 {
+            if !event::poll(wait)? {
+                break;
+            }
+            wait = Duration::ZERO;
             match event::read()? {
-                Event::Key(k) if app.handle(k, rect) => break,
+                Event::Key(k) if app.handle(k, rect) => break 'frames,
+                Event::Mouse(m) => match m.kind {
+                    MouseEventKind::ScrollUp => app.wheel(true, m.column, m.row, rect),
+                    MouseEventKind::ScrollDown => app.wheel(false, m.column, m.row, rect),
+                    _ => (),
+                },
                 Event::Resize(_, _) => {
                     terminal.clear()?;
                 }
@@ -1035,5 +1285,492 @@ mod tests {
         };
         let mut a = App::new(args);
         assert!(a.start(ratatui::layout::Rect::new(0, 0, 140, 40)).is_err());
+    }
+    fn lookup_app(project: &str) -> App {
+        let mut a = App::new(Args {
+            project: Some(PathBuf::from(project)),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        a.objective.clear();
+        a
+    }
+    fn single_issue(number: u64) -> github::Loaded {
+        github::Loaded::Single {
+            repo: github::RepoRef {
+                owner: "acme".into(),
+                name: "tool".into(),
+            },
+            issue: github::GithubIssue {
+                number,
+                title: "Title".into(),
+                body: Some("Body".into()),
+                state: "OPEN".into(),
+                url: format!("https://github.com/acme/tool/issues/{number}"),
+                milestone: None,
+                labels: vec![],
+            },
+        }
+    }
+    #[test]
+    fn lookup_for_previous_project_is_never_adopted() {
+        let mut a = lookup_app("F:/repo-a");
+        let (ticket, tx) = a.begin_lookup();
+        a.project = "F:/repo-b".into();
+        tx.send(github::Lookup {
+            ticket,
+            result: Ok(single_issue(7)),
+        })
+        .unwrap();
+        a.poll_issues();
+        assert!(a.objective.is_empty());
+        assert!(a.issues.ticket.is_none());
+        assert!(!a.issues.loading);
+        assert!(a.message.contains("Project changed"));
+    }
+    #[test]
+    fn superseded_lookup_is_dropped_and_current_one_still_applies() {
+        let mut a = lookup_app("F:/repo-a");
+        let (old, old_tx) = a.begin_lookup();
+        let (current, current_tx) = a.begin_lookup();
+        // The old receiver was replaced, so its late send fails and nothing can apply it.
+        assert!(old_tx
+            .send(github::Lookup {
+                ticket: old,
+                result: Ok(single_issue(1)),
+            })
+            .is_err());
+        current_tx
+            .send(github::Lookup {
+                ticket: current.clone(),
+                result: Ok(single_issue(2)),
+            })
+            .unwrap();
+        a.poll_issues();
+        assert_eq!(
+            a.objective.lines().next(),
+            Some("Work on GitHub issue acme/tool#2.")
+        );
+        assert!(a.issues.ticket.is_none());
+    }
+    #[test]
+    fn non_current_ticket_is_ignored_without_cancelling_the_current_lookup() {
+        let mut a = lookup_app("F:/repo-a");
+        let (current, tx) = a.begin_lookup();
+        let forged = github::Ticket {
+            id: current.id + 99,
+            project: current.project.clone(),
+        };
+        tx.send(github::Lookup {
+            ticket: forged,
+            result: Ok(single_issue(3)),
+        })
+        .unwrap();
+        a.poll_issues();
+        assert!(a.objective.is_empty());
+        assert_eq!(a.issues.ticket, Some(current));
+        assert!(a.issues.loading);
+    }
+    #[test]
+    fn escape_cancels_the_lookup_and_its_late_result_is_discarded() {
+        let mut a = lookup_app("F:/repo-a");
+        a.page = Page::Issues;
+        let (ticket, tx) = a.begin_lookup();
+        let area = ratatui::layout::Rect::new(0, 0, 140, 40);
+        a.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), area);
+        assert_eq!(a.page, Page::Setup);
+        assert!(!a.issues.loading);
+        assert!(tx
+            .send(github::Lookup {
+                ticket,
+                result: Ok(single_issue(4)),
+            })
+            .is_err());
+        a.poll_issues();
+        assert!(a.objective.is_empty());
+    }
+    #[test]
+    fn matching_project_lookup_still_preselects_issue() {
+        let mut a = lookup_app(&std::env::current_dir().unwrap().display().to_string());
+        let (ticket, tx) = a.begin_lookup();
+        tx.send(github::Lookup {
+            ticket,
+            result: Ok(single_issue(5)),
+        })
+        .unwrap();
+        a.poll_issues();
+        assert!(a.objective.starts_with("Work on GitHub issue acme/tool#5."));
+        assert_eq!(a.focus, Focus::Objective);
+    }
+
+    use ratatui::layout::Rect;
+
+    fn draw_text(app: &App, width: u16, height: u16) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+    fn region(app: &App, width: u16, height: u16, pane: Pane) -> ratatui::layout::Rect {
+        ui::regions(ratatui::layout::Rect::new(0, 0, width, height), app)
+            .into_iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| r)
+            .expect("pane is on screen")
+    }
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+    const AREA: Rect = Rect::new(0, 0, 140, 40);
+    /// A running page with a small terminal whose history can be inspected.
+    fn running_app() -> App {
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        a.page = Page::Running;
+        a.focus = Focus::Native;
+        a.terminal = vt100::Parser::new(10, 40, HISTORY_LINES);
+        a.terminal_size = (10, 40);
+        a
+    }
+    fn feed_lines(a: &mut App, range: std::ops::Range<usize>) {
+        for i in range {
+            a.terminal.process(format!("line {i}\r\n").as_bytes());
+        }
+    }
+    fn screen_row(a: &App, y: u16) -> String {
+        (0..40)
+            .map(|x| {
+                a.terminal
+                    .screen()
+                    .cell(y, x)
+                    .map(|c| c.contents().to_owned())
+                    .unwrap_or_default()
+            })
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
+    }
+    #[test]
+    fn ctrl_scroll_keys_are_never_forwarded_to_claude() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        // With no session, forwarding would replace the message. Scrolling must leave it alone.
+        a.message = "untouched".into();
+        assert!(!a.handle(key(KeyCode::Up, KeyModifiers::CONTROL), AREA));
+        assert!(!a.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL), AREA));
+        assert!(!a.handle(key(KeyCode::Home, KeyModifiers::CONTROL), AREA));
+        assert_eq!(a.message, "untouched");
+        assert!(a.terminal.screen().scrollback() > 0);
+        assert!(!a.handle(key(KeyCode::End, KeyModifiers::CONTROL), AREA));
+        assert_eq!(a.terminal.screen().scrollback(), 0);
+    }
+    #[test]
+    fn plain_keys_still_reach_claude_and_typing_returns_to_live() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        a.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL), AREA);
+        assert!(a.terminal.screen().scrollback() > 0);
+        a.message.clear();
+        // Typing is sent to Claude (here: fails because no session), and returns the reader to live.
+        a.handle(key(KeyCode::Char('x'), KeyModifiers::NONE), AREA);
+        assert_eq!(a.message, "No running Claude terminal is available");
+        assert_eq!(a.terminal.screen().scrollback(), 0);
+        // Plain PageUp is Claude's key, so it is forwarded and does not scroll the history.
+        a.message.clear();
+        a.handle(key(KeyCode::PageUp, KeyModifiers::NONE), AREA);
+        assert_eq!(a.message, "No running Claude terminal is available");
+        assert_eq!(a.terminal.screen().scrollback(), 0);
+    }
+    #[test]
+    fn history_stays_put_while_output_arrives_and_end_returns_to_live() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        // Live top row is "line 91"; one page back is "line 82".
+        a.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL), AREA);
+        assert_eq!(screen_row(&a, 0), "line 82");
+        feed_lines(&mut a, 100..150);
+        assert_eq!(
+            screen_row(&a, 0),
+            "line 82",
+            "reader must not be pulled to the bottom"
+        );
+        a.handle(key(KeyCode::End, KeyModifiers::CONTROL), AREA);
+        assert_eq!(a.terminal.screen().scrollback(), 0);
+        assert_eq!(screen_row(&a, 8), "line 149");
+    }
+    #[test]
+    fn live_observation_reads_the_live_screen_even_while_scrolled() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        a.handle(key(KeyCode::PageUp, KeyModifiers::CONTROL), AREA);
+        let scrolled = a.terminal.screen().scrollback();
+        let text = a.live_text();
+        assert!(text.contains("line 99"), "{text}");
+        assert!(!text.contains("line 82"), "{text}");
+        assert_eq!(
+            a.terminal.screen().scrollback(),
+            scrolled,
+            "reading live text must not move the reader"
+        );
+    }
+    #[test]
+    fn wheel_over_terminal_scrolls_its_history_and_wheel_elsewhere_does_not_focus() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        let term = region(&a, 140, 40, Pane::Terminal);
+        a.wheel(true, term.x + 3, term.y + 2, AREA);
+        assert_eq!(a.terminal.screen().scrollback(), 3);
+        assert_eq!(a.focus, Focus::Native);
+    }
+    #[test]
+    fn fullscreen_claude_gets_the_wheel_only_when_it_asked_for_mouse() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..100);
+        a.terminal.process(b"\x1b[?1049h");
+        let term = region(&a, 140, 40, Pane::Terminal);
+        // Alternate screen without mouse reporting: nothing to scroll, and the user is told so.
+        a.wheel(true, term.x + 3, term.y + 2, AREA);
+        assert!(a.message.contains("no scrollback"), "{}", a.message);
+        // Mouse reporting on: the wheel is passed to Claude, which fails here with no session.
+        a.message.clear();
+        a.terminal.process(b"\x1b[?1002h\x1b[?1006h");
+        a.wheel(true, term.x + 3, term.y + 2, AREA);
+        assert_eq!(a.message, "No running Claude terminal is available");
+        assert_eq!(a.terminal.screen().scrollback(), 0);
+    }
+    #[test]
+    fn f5_focuses_dashboard_and_its_keys_never_reach_claude() {
+        let mut a = running_app();
+        a.message.clear();
+        a.handle(key(KeyCode::F(5), KeyModifiers::NONE), AREA);
+        assert_eq!(a.focus, Focus::Dashboard);
+        assert_eq!(a.dash_focus, Pane::Timeline);
+        a.handle(key(KeyCode::F(5), KeyModifiers::NONE), AREA);
+        assert_eq!(
+            a.dash_focus,
+            Pane::Totals,
+            "second press cycles to the next panel"
+        );
+        a.message.clear();
+        a.handle(key(KeyCode::Char('x'), KeyModifiers::NONE), AREA);
+        assert!(
+            a.message.is_empty(),
+            "typing on the dashboard is not forwarded"
+        );
+        a.handle(key(KeyCode::F(6), KeyModifiers::NONE), AREA);
+        assert_eq!(a.focus, Focus::Native);
+    }
+    #[test]
+    fn f1_opens_controls_and_keeps_keys_away_from_claude() {
+        let mut a = running_app();
+        a.message.clear();
+        a.handle(key(KeyCode::F(1), KeyModifiers::NONE), AREA);
+        assert!(a.help_open);
+        a.handle(key(KeyCode::Char('x'), KeyModifiers::NONE), AREA);
+        assert!(a.message.is_empty());
+        assert!(!a.handle(key(KeyCode::Esc, KeyModifiers::NONE), AREA));
+        assert!(!a.help_open, "Esc closes controls without leaving the page");
+    }
+    fn issues_app(count: u64, body_lines: usize) -> App {
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        a.page = Page::Issues;
+        let body = (0..body_lines)
+            .map(|i| format!("body line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        a.issues.issues = (1..=count)
+            .map(|n| github::GithubIssue {
+                number: n,
+                title: format!("Issue {n}"),
+                body: Some(body.clone()),
+                state: "OPEN".into(),
+                url: String::new(),
+                milestone: None,
+                labels: vec![],
+            })
+            .collect();
+        a
+    }
+    #[test]
+    fn issue_preview_scrolls_independently_and_resets_for_another_issue() {
+        let mut a = issues_app(3, 80);
+        draw_text(&a, 120, 30);
+        let preview = region(&a, 120, 30, Pane::Preview);
+        a.wheel(
+            false,
+            preview.x + 2,
+            preview.y + 2,
+            Rect::new(0, 0, 120, 30),
+        );
+        assert_eq!(a.scrolls.get(Pane::Preview).top(), 3);
+        assert_eq!(a.scrolls.get(Pane::Issues).top(), 0);
+        assert_eq!(a.issues.index, 0, "wheel never changes the selected issue");
+        draw_text(&a, 120, 30);
+        assert!(a.scrolls.get(Pane::Preview).top() > 0);
+        a.handle(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            Rect::new(0, 0, 120, 30),
+        );
+        draw_text(&a, 120, 30);
+        assert_eq!(a.scrolls.get(Pane::Preview).top(), 0);
+    }
+    #[test]
+    fn issue_list_keeps_selection_visible_and_wheel_keeps_selection() {
+        let mut a = issues_app(30, 1);
+        let area = Rect::new(0, 0, 78, 21);
+        draw_text(&a, 78, 21);
+        for _ in 0..20 {
+            a.handle(key(KeyCode::Down, KeyModifiers::NONE), area);
+        }
+        draw_text(&a, 78, 21);
+        let view_top = a.scrolls.get(Pane::Issues).top();
+        let viewport = region(&a, 78, 21, Pane::Issues).height as usize - 2;
+        assert!(view_top <= 20 && 20 < view_top + viewport, "top {view_top}");
+        let top_before = a.scrolls.get(Pane::Issues).top();
+        let list = region(&a, 78, 21, Pane::Issues);
+        a.wheel(true, list.x + 2, list.y + 2, area);
+        assert_eq!(
+            a.issues.index, 20,
+            "scrolling the list keeps the selected row"
+        );
+        assert_eq!(a.scrolls.get(Pane::Issues).top(), top_before - 3);
+    }
+    #[test]
+    fn long_objective_is_reviewable_from_the_top_and_follows_the_end_while_editing() {
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: Some(
+                (0..200)
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            demo: true,
+        });
+        a.focus = Focus::Objective;
+        let at_top = draw_text(&a, 120, 30);
+        assert!(at_top.contains("line 0"));
+        assert!(!at_top.contains("line 199"));
+        // Editing pins the view to the end, so the newest text and the cursor are visible.
+        a.handle(
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            Rect::new(0, 0, 120, 30),
+        );
+        let edited = draw_text(&a, 120, 30);
+        assert!(edited.contains("line 199x"), "newest text must be visible");
+        // Scrolling up leaves the end, and the position is shown in the title.
+        a.handle(
+            key(KeyCode::Up, KeyModifiers::CONTROL),
+            Rect::new(0, 0, 120, 30),
+        );
+        assert!(draw_text(&a, 120, 30).contains("↑"));
+    }
+    #[test]
+    fn every_page_and_overlay_renders_at_small_and_large_sizes() {
+        let mut a = running_app();
+        feed_lines(&mut a, 0..300);
+        let attention = || Attention {
+            title: "Pick one".into(),
+            reason: "Two options".into(),
+            question: "Which?".into(),
+            options: vec!["a".into(), "b".into()],
+        };
+        let mut states = vec![];
+        for page in [
+            Page::Setup,
+            Page::Browser,
+            Page::Issues,
+            Page::Running,
+            Page::Finished,
+        ] {
+            for help in [false, true] {
+                for dashboard in [false, true] {
+                    let mut s = App::new(Args {
+                        project: Some(std::env::current_dir().unwrap()),
+                        issue: None,
+                        objective: Some(
+                            (0..80)
+                                .map(|i| format!("objective {i}"))
+                                .collect::<Vec<_>>()
+                                .join(
+                                    "
+",
+                                ),
+                        ),
+                        demo: true,
+                    });
+                    s.page = page;
+                    s.help_open = help;
+                    s.dashboard_expanded = dashboard;
+                    s.attention = Some(attention());
+                    s.focus = Focus::Response;
+                    s.terminal = std::mem::replace(&mut a.terminal, vt100::Parser::new(1, 1, 0));
+                    s.terminal_size = (10, 40);
+                    states.push(s);
+                }
+            }
+        }
+        for s in &states {
+            for (w, h) in [(78u16, 21u16), (100, 30), (200, 60), (30, 10)] {
+                draw_text(s, w, h);
+                // Overlays must never receive wheel events outside the screen.
+                let _ = ui::pane_at(
+                    Rect::new(0, 0, w, h),
+                    s,
+                    w.saturating_sub(1),
+                    h.saturating_sub(1),
+                );
+            }
+        }
+    }
+    #[test]
+    fn long_issue_body_wraps_and_reports_its_overflow() {
+        let mut a = issues_app(1, 0);
+        a.issues.issues[0].body = Some("word ".repeat(200));
+        let text = draw_text(&a, 78, 21);
+        // The preview is short in a narrow terminal, so the body must wrap and show a position.
+        assert!(text.contains("↓ 1-"), "{text}");
+        a.wheel(
+            false,
+            region(&a, 78, 21, Pane::Preview).x + 2,
+            region(&a, 78, 21, Pane::Preview).y + 2,
+            Rect::new(0, 0, 78, 21),
+        );
+        assert!(draw_text(&a, 78, 21).contains("↑"));
+    }
+    #[test]
+    fn status_messages_and_key_hints_are_visible_on_the_main_pages() {
+        for (width, height) in [(78u16, 21u16), (100, 30)] {
+            for page in [Page::Setup, Page::Issues, Page::Running] {
+                let mut a = running_app();
+                a.page = page;
+                a.focus = Focus::Native;
+                a.message = "Project changed; the GitHub issue lookup was cancelled.".into();
+                let text = draw_text(&a, width, height);
+                assert!(
+                    text.contains("Project changed"),
+                    "{page:?} {width}x{height}: {text}"
+                );
+                // The hint line is one line and starts with F1, so the controls panel is always reachable.
+                assert!(text.contains("F1 controls"), "{page:?} {width}x{height}");
+            }
+        }
     }
 }

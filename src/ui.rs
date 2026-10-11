@@ -1,4 +1,5 @@
 use crate::model::EventKind;
+use crate::scroll::Pane;
 use crate::{App, Attention, Focus, Page};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -91,17 +92,38 @@ fn glow_border(frame: &mut Frame, area: Rect, base: Color, phase_ms: u128) {
         }
     }
 }
-fn paragraph(
+
+/// Draws one bordered pane. Content longer than the pane scrolls from the pane's own offset,
+/// and the title shows the position while it overflows. Lists do not wrap, because their rows
+/// are already shortened to the pane width; everything else wraps so no text is cut off.
+fn pane(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
+    which: Pane,
     title: &str,
-    content: Vec<Line<'static>>,
     colour: Color,
+    content: Vec<Line<'static>>,
 ) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let wraps = !matches!(which, Pane::Folders | Pane::Issues | Pane::Timeline);
+    let mut body = Paragraph::new(content);
+    if wraps {
+        body = body.wrap(Wrap { trim: false });
+    }
+    let view = app.scrolls.get(which);
+    let inner_width = area.width.saturating_sub(2);
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let top = view.sync(body.line_count(inner_width), inner_height);
+    let title = match view.status() {
+        Some(status) => format!("{title}  {status}"),
+        None => title.to_owned(),
+    };
     frame.render_widget(
-        Paragraph::new(content)
-            .block(block(title, colour))
-            .wrap(Wrap { trim: false }),
+        body.block(block(&title, colour))
+            .scroll((top.min(u16::MAX as usize) as u16, 0)),
         area,
     );
 }
@@ -116,7 +138,7 @@ fn divide(area: Rect, items: &[Constraint], horizontal: bool) -> Vec<Rect> {
         .split(area)
         .to_vec()
 }
-fn lines<'a>(s: &'a str) -> Vec<Line<'a>> {
+fn lines(s: &str) -> Vec<Line<'static>> {
     s.lines().map(|x| Line::raw(x.to_owned())).collect()
 }
 fn accent(text: String, style: Color) -> Line<'static> {
@@ -156,25 +178,63 @@ fn header(frame: &mut Frame, area: Rect, page: Page, demo: bool) {
         area,
     );
 }
-fn setup(frame: &mut Frame, area: Rect, app: &App) {
-    let parts = divide(
+
+// Layout is computed in one place per page. Drawing and mouse hit-testing both use these
+// functions, so a wheel event always reaches the pane that is actually on screen.
+fn shell(area: Rect) -> Vec<Rect> {
+    divide(
         area,
+        &[
+            Constraint::Length(3),
+            Constraint::Min(13),
+            Constraint::Length(4),
+        ],
+        false,
+    )
+}
+fn setup_parts(body: Rect) -> Vec<Rect> {
+    divide(
+        body,
         &[
             Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(8),
         ],
         false,
+    )
+}
+fn browser_parts(body: Rect) -> Vec<Rect> {
+    divide(body, &[Constraint::Length(4), Constraint::Min(5)], false)
+}
+/// Header, issue list, preview. Narrow terminals stack list above preview; wide ones go side by side.
+fn issues_parts(body: Rect) -> Vec<Rect> {
+    let parts = divide(body, &[Constraint::Length(4), Constraint::Min(5)], false);
+    let panes = divide(
+        parts[1],
+        &[Constraint::Percentage(50), Constraint::Percentage(50)],
+        body.width >= 100,
     );
+    vec![parts[0], panes[0], panes[1]]
+}
+
+fn setup(frame: &mut Frame, body: Rect, app: &App) {
+    let parts = setup_parts(body);
     let project_label = if app.focus == Focus::Project {
         "PROJECT PATH  < EDITING >"
     } else {
         "PROJECT PATH"
     };
-    paragraph(
+    pane(
         frame,
         parts[0],
+        app,
+        Pane::Project,
         project_label,
+        if app.focus == Focus::Project {
+            CYAN
+        } else {
+            MUTED
+        },
         vec![
             Line::raw(
                 "Type full directory path. F2: browse folders, Up/Down: recent project.".to_owned(),
@@ -192,11 +252,6 @@ fn setup(frame: &mut Frame, area: Rect, app: &App) {
                 CYAN,
             ),
         ],
-        if app.focus == Focus::Project {
-            CYAN
-        } else {
-            MUTED
-        },
     );
     let objective_label = if app.focus == Focus::Objective {
         "OBJECTIVE  < EDITING >  |  Ctrl+L clear all"
@@ -213,18 +268,18 @@ fn setup(frame: &mut Frame, area: Rect, app: &App) {
     if app.focus == Focus::Objective {
         content.push(accent("█".into(), CYAN));
     }
-    frame.render_widget(
-        Paragraph::new(content)
-            .block(block(
-                objective_label,
-                if app.focus == Focus::Objective {
-                    CYAN
-                } else {
-                    MUTED
-                },
-            ))
-            .wrap(Wrap { trim: false }),
+    pane(
+        frame,
         parts[1],
+        app,
+        Pane::Objective,
+        objective_label,
+        if app.focus == Focus::Objective {
+            CYAN
+        } else {
+            MUTED
+        },
+        content,
     );
     let mut history = vec![accent(
         "RECENT PROJECTS  (Up/Down on project field)".to_owned(),
@@ -236,14 +291,17 @@ fn setup(frame: &mut Frame, area: Rect, app: &App) {
             .take(3)
             .map(|x| Line::raw(format!("  {x}"))),
     );
-    paragraph(frame, parts[2], "LAUNCH", history, OPUS);
+    pane(frame, parts[2], app, Pane::Recent, "LAUNCH", OPUS, history);
 }
-fn browser(frame: &mut Frame, area: Rect, app: &App) {
-    let parts = divide(area, &[Constraint::Length(4), Constraint::Min(5)], false);
-    paragraph(
+fn browser(frame: &mut Frame, body: Rect, app: &App) {
+    let parts = browser_parts(body);
+    pane(
         frame,
         parts[0],
+        app,
+        Pane::BrowserPath,
         "CURRENT DIRECTORY",
+        CYAN,
         vec![
             Line::raw(app.browser_dir.display().to_string()),
             accent(
@@ -251,16 +309,11 @@ fn browser(frame: &mut Frame, area: Rect, app: &App) {
                 CYAN,
             ),
         ],
-        CYAN,
     );
-    let visible = parts[1].height.saturating_sub(2) as usize;
-    let start = app.browser_index.saturating_sub(visible.saturating_sub(1));
     let items = app
         .browser_entries
         .iter()
         .enumerate()
-        .skip(start)
-        .take(visible)
         .map(|(i, p)| {
             let name = if i == 0 {
                 "..  [PARENT DIRECTORY]".into()
@@ -290,24 +343,24 @@ fn browser(frame: &mut Frame, area: Rect, app: &App) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(items).block(block("FOLDERS", MUTED)),
-        parts[1],
-    );
+    pane(frame, parts[1], app, Pane::Folders, "FOLDERS", MUTED, items);
 }
-fn issues(frame: &mut Frame, area: Rect, app: &App) {
+fn issues(frame: &mut Frame, body: Rect, app: &App) {
     let browser = &app.issues;
-    let parts = divide(area, &[Constraint::Length(4), Constraint::Min(5)], false);
+    let parts = issues_parts(body);
     let repo = browser
         .repo
         .as_ref()
         .map(|r| r.slug())
         .unwrap_or_else(|| "GitHub".into());
     let visible = browser.visible();
-    paragraph(
+    pane(
         frame,
         parts[0],
+        app,
+        Pane::IssuesHeader,
         "OPEN ISSUES",
+        CYAN,
         vec![
             Line::raw(format!(
                 "{repo}  |  {} of {} shown  |  Filter: {}{}",
@@ -317,18 +370,11 @@ fn issues(frame: &mut Frame, area: Rect, app: &App) {
                 if browser.loading { "  (loading)" } else { "" }
             )),
             accent(
-                "Type to filter by title or number   Up/Down/PgUp/PgDn move   Enter use   Ctrl+R refresh   Esc back"
+                "Type to filter   Up/Down/PgUp/PgDn select   Tab list/preview   Enter use   Ctrl+R refresh   Esc back"
                     .into(),
                 CYAN,
             ),
         ],
-        CYAN,
-    );
-    // Narrow terminals stack list above preview; wide ones place them side by side.
-    let panes = divide(
-        parts[1],
-        &[Constraint::Percentage(50), Constraint::Percentage(50)],
-        area.width >= 100,
     );
     if visible.is_empty() {
         let status = if browser.status.is_empty() {
@@ -336,18 +382,30 @@ fn issues(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             browser.status.clone()
         };
-        paragraph(frame, panes[0], "ISSUES", vec![Line::raw(status)], MUTED);
-        paragraph(frame, panes[1], "PREVIEW", vec![], MUTED);
+        pane(
+            frame,
+            parts[1],
+            app,
+            Pane::Issues,
+            "ISSUES",
+            MUTED,
+            vec![Line::raw(status)],
+        );
+        pane(
+            frame,
+            parts[2],
+            app,
+            Pane::Preview,
+            "PREVIEW",
+            MUTED,
+            vec![],
+        );
         return;
     }
-    let rows = panes[0].height.saturating_sub(2) as usize;
-    let start = browser.index.saturating_sub(rows.saturating_sub(1));
-    let width = panes[0].width.saturating_sub(4) as usize;
+    let width = parts[1].width.saturating_sub(4) as usize;
     let items = visible
         .iter()
         .enumerate()
-        .skip(start)
-        .take(rows)
         .map(|(i, issue)| {
             let selected = i == browser.index;
             let milestone = issue
@@ -372,47 +430,60 @@ fn issues(frame: &mut Frame, area: Rect, app: &App) {
             )
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(items).block(block(&status_title(&browser.status), MUTED)),
-        panes[0],
+    pane(
+        frame,
+        parts[1],
+        app,
+        Pane::Issues,
+        &status_title(&browser.status),
+        MUTED,
+        items,
     );
-    let Some(issue) = browser.selected() else {
-        return;
-    };
-    let mut preview = vec![
-        Line::styled(
-            format!("#{} {}", issue.number, issue.title.trim()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        accent(
-            format!(
-                "State: {}  |  Milestone: {}",
-                if issue.state.is_empty() {
-                    "unknown"
-                } else {
-                    issue.state.as_str()
-                },
-                issue
-                    .milestone
-                    .as_ref()
-                    .map_or("none", |m| m.title.as_str())
+    let mut preview = vec![];
+    if let Some(issue) = browser.selected() {
+        preview = vec![
+            Line::styled(
+                format!("#{} {}", issue.number, issue.title.trim()),
+                Style::default().add_modifier(Modifier::BOLD),
             ),
-            OPUS,
-        ),
-    ];
-    if !issue.labels.is_empty() {
-        let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
-        preview.push(Line::raw(format!("Labels: {}", names.join(", "))));
+            accent(
+                format!(
+                    "State: {}  |  Milestone: {}",
+                    if issue.state.is_empty() {
+                        "unknown"
+                    } else {
+                        issue.state.as_str()
+                    },
+                    issue
+                        .milestone
+                        .as_ref()
+                        .map_or("none", |m| m.title.as_str())
+                ),
+                OPUS,
+            ),
+        ];
+        if !issue.labels.is_empty() {
+            let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+            preview.push(Line::raw(format!("Labels: {}", names.join(", "))));
+        }
+        preview.push(Line::raw(issue.url.clone()));
+        preview.push(Line::raw(""));
+        let body = issue.body();
+        if body.is_empty() {
+            preview.push(accent("(no description)".into(), MUTED));
+        } else {
+            preview.extend(body.lines().map(|l| Line::raw(l.to_owned())));
+        }
     }
-    preview.push(Line::raw(issue.url.clone()));
-    preview.push(Line::raw(""));
-    let body = issue.body();
-    if body.is_empty() {
-        preview.push(accent("(no description)".into(), MUTED));
-    } else {
-        preview.extend(body.lines().map(|l| Line::raw(l.to_owned())));
-    }
-    paragraph(frame, panes[1], "PREVIEW", preview, CYAN);
+    pane(
+        frame,
+        parts[2],
+        app,
+        Pane::Preview,
+        "PREVIEW",
+        CYAN,
+        preview,
+    );
 }
 fn status_title(status: &str) -> String {
     if status.is_empty() {
@@ -434,7 +505,11 @@ fn render_terminal(frame: &mut Frame, area: Rect, app: &App) {
     }
     let (rows, cols) = app.terminal_size;
     let screen = app.terminal.screen();
+    // vt100 keeps the history; a non-zero offset means the reader is looking back.
+    let back = screen.scrollback();
     let (cursor_y, cursor_x) = screen.cursor_position();
+    // The cursor belongs to the live screen, so it is hidden while reading history.
+    let show_cursor = back == 0 && app.focus == Focus::Native;
     let mut output: Vec<Line> = Vec::with_capacity(rows as usize);
     for y in 0..rows {
         let mut spans: Vec<Span> = Vec::new();
@@ -459,12 +534,11 @@ fn render_terminal(frame: &mut Frame, area: Rect, app: &App) {
                 if cell.underline() {
                     style = style.add_modifier(Modifier::UNDERLINED);
                 }
-                if cell.inverse() || (y == cursor_y && x == cursor_x && app.focus == Focus::Native)
-                {
+                if cell.inverse() || (show_cursor && y == cursor_y && x == cursor_x) {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
                 let content = if cell.has_contents() {
-                    cell.contents()
+                    cell.contents().to_owned()
                 } else {
                     " ".to_string()
                 };
@@ -482,10 +556,12 @@ fn render_terminal(frame: &mut Frame, area: Rect, app: &App) {
         }
         output.push(Line::from(spans));
     }
-    frame.render_widget(
-        Paragraph::new(output).block(block("INTERACTIVE CLAUDE TERMINAL  |  F6 focus", ORANGE)),
-        area,
-    );
+    let title = if back > 0 {
+        format!("CLAUDE TERMINAL  |  history -{back}  |  Ctrl+End live")
+    } else {
+        "INTERACTIVE CLAUDE TERMINAL  |  F6 focus".to_owned()
+    };
+    frame.render_widget(Paragraph::new(output).block(block(&title, ORANGE)), area);
 }
 
 // The dashboard retains Claude as the only orchestrator. All boxes render
@@ -590,12 +666,7 @@ fn review_started(app: &App) -> bool {
 fn review_finished(app: &App) -> bool {
     app.live.objective_complete || app.telemetry.review.objective_complete
 }
-fn lead_and_opus(frame: &mut Frame, area: Rect, app: &App) {
-    let widths = divide(
-        area,
-        &[Constraint::Percentage(68), Constraint::Percentage(32)],
-        true,
-    );
+fn lead_and_opus(frame: &mut Frame, lead_area: Rect, advisor_area: Rect, app: &App) {
     let lead = app.telemetry.actors.get("main");
     let mut content = vec![
         accent(
@@ -614,11 +685,19 @@ fn lead_and_opus(frame: &mut Frame, area: Rect, app: &App) {
     ];
     content.extend(stats_lines(
         lead,
-        widths[0].width.saturating_sub(3) as usize,
+        lead_area.width.saturating_sub(3) as usize,
     ));
-    paragraph(frame, widths[0], "HAIKU 5.5 / MAIN", content, ORANGE);
+    pane(
+        frame,
+        lead_area,
+        app,
+        Pane::Lead,
+        "HAIKU 5.5 / MAIN",
+        ORANGE,
+        content,
+    );
     if active_agent(app, "main") {
-        glow_border(frame, widths[0], ORANGE, app.started.elapsed().as_millis());
+        glow_border(frame, lead_area, ORANGE, app.started.elapsed().as_millis());
     }
     let mut advisor = vec![accent("OPUS 5.5  //  ON CALL".into(), OPUS)];
     let calls = app
@@ -658,7 +737,15 @@ fn lead_and_opus(frame: &mut Frame, area: Rect, app: &App) {
         advisor.push(accent("Currently advising (live terminal)".into(), OPUS));
     }
     advisor.push(accent("Advice does not confirm final review".into(), MUTED));
-    paragraph(frame, widths[1], "OPUS ADVISOR", advisor, OPUS);
+    pane(
+        frame,
+        advisor_area,
+        app,
+        Pane::Advisor,
+        "OPUS ADVISOR",
+        OPUS,
+        advisor,
+    );
     let advisor_busy = !review_finished(app)
         && (app.live.advisor_in_flight
             || (calls > app.telemetry.advisor_completed
@@ -666,7 +753,7 @@ fn lead_and_opus(frame: &mut Frame, area: Rect, app: &App) {
                     .activity
                     .recent("main", std::time::Duration::from_secs(5))));
     if advisor_busy {
-        glow_border(frame, widths[1], OPUS, app.started.elapsed().as_millis());
+        glow_border(frame, advisor_area, OPUS, app.started.elapsed().as_millis());
     }
 }
 // Summary strip. This deliberately does not claim to perform routing or
@@ -729,10 +816,13 @@ fn run_totals(frame: &mut Frame, area: Rect, app: &App) {
             _ => format!("Estimated API cost >=${:.4} + unobserved usage", t.list_usd),
         }
     };
-    paragraph(
+    pane(
         frame,
         area,
+        app,
+        Pane::Totals,
         "RUN TOTALS / OBSERVED",
+        CYAN,
         vec![
             accent(
                 format!(
@@ -762,7 +852,6 @@ fn run_totals(frame: &mut Frame, area: Rect, app: &App) {
                 ORANGE,
             ),
         ],
-        CYAN,
     );
     if !app.output_end
         && !review_finished(app)
@@ -771,14 +860,19 @@ fn run_totals(frame: &mut Frame, area: Rect, app: &App) {
         glow_border(frame, area, CYAN, app.started.elapsed().as_millis());
     }
 }
+fn worker_pane(idx: usize) -> Pane {
+    [Pane::Worker0, Pane::Worker1, Pane::Worker2][idx]
+}
 fn worker_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
     let Some(worker) = app.team.agents.get(idx) else {
-        paragraph(
+        pane(
             frame,
             area,
+            app,
+            worker_pane(idx),
             "HAIKU / AVAILABLE",
-            vec![accent("Waiting for Claude teammate".into(), MUTED)],
             CYAN,
+            vec![accent("Waiting for Claude teammate".into(), MUTED)],
         );
         return;
     };
@@ -817,12 +911,14 @@ fn worker_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
             content.push(Line::raw(shorten(&format!("Last: {}", t.action), max)));
         }
     }
-    paragraph(
+    pane(
         frame,
         area,
+        app,
+        worker_pane(idx),
         &format!("HAIKU / {}", shorten(&worker.name, max.saturating_sub(10))),
-        content,
         CYAN,
+        content,
     );
     if worker.state != "TASK COMPLETE"
         && worker.state != "WAITING"
@@ -836,17 +932,8 @@ fn worker_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
         );
     }
 }
-fn workers(frame: &mut Frame, area: Rect, app: &App) {
-    let parts = divide(
-        area,
-        &[
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ],
-        area.width >= 65,
-    );
-    for (i, part) in parts.into_iter().enumerate() {
+fn workers(frame: &mut Frame, areas: [Rect; 3], app: &App) {
+    for (i, part) in areas.into_iter().enumerate() {
         worker_card(frame, part, app, i);
     }
 }
@@ -879,15 +966,17 @@ fn review_strip(frame: &mut Frame, area: Rect, app: &App) {
         None if started => "Review requested; awaiting Opus consultation / result".into(),
         None => "No final review stage observed yet".into(),
     };
-    paragraph(
+    pane(
         frame,
         area,
+        app,
+        Pane::Review,
         "OPUS 5.5 / FINAL REVIEW",
+        OPUS,
         vec![
             accent(label.into(), OPUS),
             Line::raw(shorten(&detail, area.width.saturating_sub(3) as usize)),
         ],
-        OPUS,
     );
     // A review announcement by itself must NOT animate an idle Opus panel.
     if started && !ended && app.live.advisor_in_flight && app.live.advisor_after_review {
@@ -920,7 +1009,6 @@ fn event_text(kind: &EventKind) -> String {
     }
 }
 fn timeline(frame: &mut Frame, area: Rect, app: &App) {
-    let cap = area.height.saturating_sub(2) as usize;
     let rows: Vec<Line<'static>> = if app.telemetry.events.is_empty() {
         vec![accent(
             "Waiting for tool activity in local Claude JSONL transcripts".into(),
@@ -930,11 +1018,6 @@ fn timeline(frame: &mut Frame, area: Rect, app: &App) {
         app.telemetry
             .events
             .iter()
-            .rev()
-            .take(cap)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .map(|e| {
                 Line::from(vec![
                     Span::styled(format!("{}  ", clock(e.at)), Style::default().fg(MUTED)),
@@ -947,14 +1030,39 @@ fn timeline(frame: &mut Frame, area: Rect, app: &App) {
             })
             .collect()
     };
-    paragraph(frame, area, "SESSION LOG / LIVE TOOL ACTIVITY", rows, MUTED);
+    pane(
+        frame,
+        area,
+        app,
+        Pane::Timeline,
+        "SESSION LOG / LIVE TOOL ACTIVITY",
+        MUTED,
+        rows,
+    );
 }
-fn agent_dashboard(frame: &mut Frame, area: Rect, app: &App) {
+/// Every dashboard panel's rectangle, shared by drawing and hit-testing.
+struct Dash {
+    short: bool,
+    totals: Rect,
+    lead: Rect,
+    advisor: Rect,
+    workers: [Rect; 3],
+    review: Rect,
+    timeline: Rect,
+}
+fn dash_layout(area: Rect) -> Dash {
+    let none = Rect::default();
     if area.height < 24 {
         let p = divide(area, &[Constraint::Length(5), Constraint::Min(5)], false);
-        run_totals(frame, p[0], app);
-        timeline(frame, p[1], app);
-        return;
+        return Dash {
+            short: true,
+            totals: p[0],
+            lead: none,
+            advisor: none,
+            workers: [none; 3],
+            review: none,
+            timeline: p[1],
+        };
     }
     let parts = divide(
         area,
@@ -967,11 +1075,71 @@ fn agent_dashboard(frame: &mut Frame, area: Rect, app: &App) {
         ],
         false,
     );
-    run_totals(frame, parts[0], app);
-    lead_and_opus(frame, parts[1], app);
-    workers(frame, parts[2], app);
-    review_strip(frame, parts[3], app);
-    timeline(frame, parts[4], app);
+    let lead = divide(
+        parts[1],
+        &[Constraint::Percentage(68), Constraint::Percentage(32)],
+        true,
+    );
+    let w = divide(
+        parts[2],
+        &[
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ],
+        parts[2].width >= 65,
+    );
+    Dash {
+        short: false,
+        totals: parts[0],
+        lead: lead[0],
+        advisor: lead[1],
+        workers: [w[0], w[1], w[2]],
+        review: parts[3],
+        timeline: parts[4],
+    }
+}
+fn dash_regions(area: Rect) -> Vec<(Pane, Rect)> {
+    let d = dash_layout(area);
+    if d.short {
+        return vec![(Pane::Totals, d.totals), (Pane::Timeline, d.timeline)];
+    }
+    vec![
+        (Pane::Totals, d.totals),
+        (Pane::Lead, d.lead),
+        (Pane::Advisor, d.advisor),
+        (Pane::Worker0, d.workers[0]),
+        (Pane::Worker1, d.workers[1]),
+        (Pane::Worker2, d.workers[2]),
+        (Pane::Review, d.review),
+        (Pane::Timeline, d.timeline),
+    ]
+}
+fn agent_dashboard(frame: &mut Frame, area: Rect, app: &App) {
+    let d = dash_layout(area);
+    run_totals(frame, d.totals, app);
+    if d.short {
+        timeline(frame, d.timeline, app);
+        return;
+    }
+    lead_and_opus(frame, d.lead, d.advisor, app);
+    workers(frame, d.workers, app);
+    review_strip(frame, d.review, app);
+    timeline(frame, d.timeline, app);
+}
+/// The approval overlay, centred over the running page. Only shown while Claude is waiting.
+fn attention_rect(body: Rect, app: &App) -> Option<Rect> {
+    app.attention
+        .as_ref()
+        .filter(|_| app.focus == Focus::Response)?;
+    let width = body.width.saturating_sub(10).min(106);
+    let height = 13u16.min(body.height.saturating_sub(2)).max(4);
+    Some(Rect {
+        x: body.x + (body.width.saturating_sub(width)) / 2,
+        y: body.y + (body.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    })
 }
 fn attention_panel(frame: &mut Frame, area: Rect, att: &Attention, app: &App) {
     if area.width < 30 || area.height < 4 {
@@ -1001,72 +1169,185 @@ fn attention_panel(frame: &mut Frame, area: Rect, att: &Attention, app: &App) {
         ),
     ];
     frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(content)
-            .wrap(Wrap { trim: true })
-            .block(block(
-                "NEEDS ATTENTION  //  HUMAN INPUT REQUIRED",
-                Color::Yellow,
-            )),
+    pane(
+        frame,
         area,
+        app,
+        Pane::Attention,
+        "NEEDS ATTENTION  //  HUMAN INPUT REQUIRED",
+        Color::Yellow,
+        content,
     );
 }
-fn running(frame: &mut Frame, area: Rect, app: &App) {
+/// Where the running page places each pane. The attention overlay, when shown, comes last.
+fn running_regions(body: Rect, app: &App) -> Vec<(Pane, Rect)> {
+    let mut out = Vec::new();
     if app.dashboard_expanded {
-        agent_dashboard(frame, area, app);
+        out.extend(dash_regions(body));
     } else if app.terminal_expanded {
-        render_terminal(frame, area, app);
+        out.push((Pane::Terminal, body));
+    } else {
+        let seg = divide(
+            body,
+            &[Constraint::Percentage(58), Constraint::Percentage(42)],
+            true,
+        );
+        out.extend(dash_regions(seg[0]));
+        out.push((Pane::Terminal, seg[1]));
+    }
+    if let Some(rect) = attention_rect(body, app) {
+        out.push((Pane::Attention, rect));
+    }
+    out
+}
+fn running(frame: &mut Frame, body: Rect, app: &App) {
+    if app.dashboard_expanded {
+        agent_dashboard(frame, body, app);
+    } else if app.terminal_expanded {
+        render_terminal(frame, body, app);
     } else {
         let segments = divide(
-            area,
+            body,
             &[Constraint::Percentage(58), Constraint::Percentage(42)],
             true,
         );
         agent_dashboard(frame, segments[0], app);
         render_terminal(frame, segments[1], app);
     }
-    if let Some(a) = app
-        .attention
-        .as_ref()
-        .filter(|_| app.focus == Focus::Response)
-    {
-        let width = area.width.saturating_sub(10).min(106);
-        let height = 13u16.min(area.height.saturating_sub(2)).max(4);
-        let r = Rect {
-            x: area.x + (area.width.saturating_sub(width)) / 2,
-            y: area.y + (area.height.saturating_sub(height)) / 2,
-            width,
-            height,
-        };
-        attention_panel(frame, r, a, app);
+    if let (Some(a), Some(rect)) = (app.attention.as_ref(), attention_rect(body, app)) {
+        attention_panel(frame, rect, a, app);
     }
 }
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.page {
         Page::Setup => {
-            "Tab fields | F2 folders | F3 GitHub issues | Ctrl+L clear | F5 start | Esc quit"
-                .to_owned()
+            "F1 controls | Tab | F2 folders | F3 issues | Ctrl+L clear | F5 start | Esc".to_owned()
         }
-        Page::Browser => "Up/Down browse | Enter folder | S select | Esc back".to_owned(),
+        Page::Browser => {
+            "F1 controls | Up/Down browse | Enter folder | S select | Esc back".to_owned()
+        }
         Page::Issues => {
-            "Type filter | Up/Down move | Enter use issue | Ctrl+R refresh | Esc back".to_owned()
+            "F1 controls | Type filter | Up/Down | Enter use | Tab | Ctrl+R | Esc".to_owned()
         }
         Page::Running => {
             if app.close_confirm {
                 "CTRL+Q again to exit and terminate embedded Claude".into()
             } else {
-                "F4 pause/resume clock | F6 Claude | F8 terminal | F9 tree | F7 attention | Ctrl+Q twice quit".into()
+                "F1 controls | F4 clock | F5 panel | F6 Claude | F8 terminal | Ctrl+Q x2".into()
             }
         }
         Page::Finished => {
             "Claude session ended | F10 or Enter new project/objective | Esc quit".into()
         }
     };
-    frame.render_widget(
-        Paragraph::new(vec![accent(text, CYAN), Line::raw(app.message.clone())])
-            .block(block("CONTROLS / STATUS", MUTED)),
+    pane(
+        frame,
         area,
+        app,
+        Pane::Footer,
+        "CONTROLS / STATUS",
+        MUTED,
+        vec![accent(text, CYAN), Line::raw(app.message.clone())],
     );
+}
+
+/// Every control, in one scrollable panel. F1 opens it on any page.
+fn help_lines() -> Vec<Line<'static>> {
+    let section = |title: &str| accent(title.to_owned(), ORANGE);
+    vec![
+        section("SCROLLING (every panel)"),
+        Line::raw("  Mouse wheel             scroll the panel under the pointer"),
+        Line::raw("  Ctrl+Up / Ctrl+Down     scroll the focused panel one line"),
+        Line::raw("  Ctrl+PgUp / Ctrl+PgDn   scroll one page"),
+        Line::raw("  Ctrl+Home / Ctrl+End    top / bottom"),
+        Line::raw("  Scrolling never changes the selection or sends keys to Claude."),
+        section("SETUP"),
+        Line::raw("  Tab switch project/objective    Ctrl+Up/Down scroll the objective"),
+        Line::raw("  F2 folders   F3 GitHub issues   F5 start   Ctrl+L clear   Esc quit"),
+        section("GITHUB ISSUES"),
+        Line::raw("  Up/Down PgUp/PgDn select; the list follows the selection"),
+        Line::raw("  Tab moves Ctrl+scroll between the list and the preview"),
+        Line::raw("  Enter use issue   Ctrl+R refresh   Esc back (cancels a pending load)"),
+        section("RUNNING"),
+        Line::raw("  F6 focus Claude   F7 answer attention   F8 full terminal   F9 full dashboard"),
+        Line::raw("  F5 select the next dashboard panel   F4 pause/resume clock"),
+        Line::raw("  Claude terminal history: Ctrl+Up/Down, Ctrl+PgUp/PgDn, Ctrl+Home (oldest)."),
+        Line::raw(
+            "  Ctrl+End or typing returns to the live screen. Output keeps arriving meanwhile.",
+        ),
+        Line::raw("  Fullscreen Claude (alternate screen) has no history. The wheel is passed"),
+        Line::raw("  to Claude only when Claude asked for mouse input."),
+        Line::raw("  Mouse capture is on, so text selection needs your terminal's bypass key."),
+        Line::raw("  Ctrl+Q twice quit"),
+        section("HELP"),
+        Line::raw("  F1 or Esc close this panel"),
+    ]
+}
+fn help_rect(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(92);
+    let height = area.height.saturating_sub(2).clamp(4, 30);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+fn help(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    pane(
+        frame,
+        area,
+        app,
+        Pane::Help,
+        "CONTROLS  |  wheel or Ctrl+Up/Down scroll  |  F1 close",
+        CYAN,
+        help_lines(),
+    );
+}
+
+/// Every pane on the current page, with its rectangle. Mouse hit-testing reads this, and
+/// `draw` lays out from the same helpers, so they agree on what is on screen.
+pub fn regions(area: Rect, app: &App) -> Vec<(Pane, Rect)> {
+    if area.width < 78 || area.height < 21 {
+        return vec![];
+    }
+    let shell = shell(area);
+    let body = shell[1];
+    let mut out = match app.page {
+        Page::Setup => {
+            let p = setup_parts(body);
+            vec![
+                (Pane::Project, p[0]),
+                (Pane::Objective, p[1]),
+                (Pane::Recent, p[2]),
+            ]
+        }
+        Page::Browser => {
+            let p = browser_parts(body);
+            vec![(Pane::BrowserPath, p[0]), (Pane::Folders, p[1])]
+        }
+        Page::Issues => {
+            let p = issues_parts(body);
+            vec![
+                (Pane::IssuesHeader, p[0]),
+                (Pane::Issues, p[1]),
+                (Pane::Preview, p[2]),
+            ]
+        }
+        Page::Running | Page::Finished => running_regions(body, app),
+    };
+    out.push((Pane::Footer, shell[2]));
+    if app.help_open {
+        out.push((Pane::Help, help_rect(area)));
+    }
+    out
+}
+/// The pane under a screen position, if any. The topmost overlay wins.
+pub fn pane_at(area: Rect, app: &App, column: u16, row: u16) -> Option<(Pane, Rect)> {
+    regions(area, app).into_iter().rev().find(|(_, r)| {
+        column >= r.x && column < r.x + r.width && row >= r.y && row < r.y + r.height
+    })
 }
 
 pub fn native_dimensions(whole: Rect, expanded: bool) -> (u16, u16) {
@@ -1087,15 +1368,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         small_frame(frame, "Increase terminal to at least 78 columns x 21 rows.");
         return;
     }
-    let shell = divide(
-        area,
-        &[
-            Constraint::Length(3),
-            Constraint::Min(13),
-            Constraint::Length(4),
-        ],
-        false,
-    );
+    let shell = shell(area);
     header(frame, shell[0], app.page, app.demo);
     match app.page {
         Page::Setup => setup(frame, shell[1], app),
@@ -1104,6 +1377,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Page::Running | Page::Finished => running(frame, shell[1], app),
     }
     footer(frame, shell[2], app);
+    if app.help_open {
+        help(frame, help_rect(area), app);
+    }
 }
 
 #[cfg(test)]
@@ -1156,7 +1432,7 @@ mod issue_page_tests {
         assert!(narrow.contains("PREVIEW"));
         let wide = screen(120, 30, &app);
         assert!(wide.contains("Select issues"));
-        assert!(wide.contains("Enter use issue"));
+        assert!(wide.contains("Enter use"));
     }
     #[test]
     fn hostile_issue_text_never_reaches_the_screen_as_control_codes() {

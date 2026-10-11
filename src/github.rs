@@ -176,6 +176,19 @@ fn sanitize_line(text: &str) -> String {
     sanitize(text).replace('\n', " ").trim().to_owned()
 }
 
+/// Identifies one background lookup and the project folder it was started for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ticket {
+    pub id: u64,
+    pub project: String,
+}
+
+/// A finished lookup, tagged with the ticket it was started under.
+pub struct Lookup {
+    pub ticket: Ticket,
+    pub result: Result<Loaded, Error>,
+}
+
 /// Picker state for the Issues page. Filtering and selection are pure so they stay testable.
 #[derive(Default)]
 pub struct IssueBrowser {
@@ -185,8 +198,10 @@ pub struct IssueBrowser {
     pub index: usize,
     pub status: String,
     pub loading: bool,
+    /// The only lookup whose result may be applied. Cleared on cancel, supersede or project change.
+    pub ticket: Option<Ticket>,
     /// Replacing or dropping this receiver discards a stale load. Its thread's send then fails harmlessly.
-    pub rx: Option<Receiver<Result<Loaded, Error>>>,
+    pub rx: Option<Receiver<Lookup>>,
 }
 impl IssueBrowser {
     pub fn visible(&self) -> Vec<&GithubIssue> {
