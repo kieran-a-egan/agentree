@@ -295,6 +295,132 @@ fn browser(frame: &mut Frame, area: Rect, app: &App) {
         parts[1],
     );
 }
+fn issues(frame: &mut Frame, area: Rect, app: &App) {
+    let browser = &app.issues;
+    let parts = divide(area, &[Constraint::Length(4), Constraint::Min(5)], false);
+    let repo = browser
+        .repo
+        .as_ref()
+        .map(|r| r.slug())
+        .unwrap_or_else(|| "GitHub".into());
+    let visible = browser.visible();
+    paragraph(
+        frame,
+        parts[0],
+        "OPEN ISSUES",
+        vec![
+            Line::raw(format!(
+                "{repo}  |  {} of {} shown  |  Filter: {}{}",
+                visible.len(),
+                browser.issues.len(),
+                browser.filter,
+                if browser.loading { "  (loading)" } else { "" }
+            )),
+            accent(
+                "Type to filter by title or number   Up/Down/PgUp/PgDn move   Enter use   Ctrl+R refresh   Esc back"
+                    .into(),
+                CYAN,
+            ),
+        ],
+        CYAN,
+    );
+    // Narrow terminals stack list above preview; wide ones place them side by side.
+    let panes = divide(
+        parts[1],
+        &[Constraint::Percentage(50), Constraint::Percentage(50)],
+        area.width >= 100,
+    );
+    if visible.is_empty() {
+        let status = if browser.status.is_empty() {
+            "No issues match the filter.".to_owned()
+        } else {
+            browser.status.clone()
+        };
+        paragraph(frame, panes[0], "ISSUES", vec![Line::raw(status)], MUTED);
+        paragraph(frame, panes[1], "PREVIEW", vec![], MUTED);
+        return;
+    }
+    let rows = panes[0].height.saturating_sub(2) as usize;
+    let start = browser.index.saturating_sub(rows.saturating_sub(1));
+    let width = panes[0].width.saturating_sub(4) as usize;
+    let items = visible
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, issue)| {
+            let selected = i == browser.index;
+            let milestone = issue
+                .milestone
+                .as_ref()
+                .map(|m| format!("  [{}]", m.title))
+                .unwrap_or_default();
+            Line::styled(
+                shorten(
+                    &format!(
+                        " {} #{} {}{}",
+                        if selected { "▶" } else { " " },
+                        issue.number,
+                        issue.title.trim(),
+                        milestone
+                    ),
+                    width,
+                ),
+                Style::default()
+                    .fg(if selected { Color::Black } else { Color::Gray })
+                    .bg(if selected { CYAN } else { Color::Reset }),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(items).block(block(&status_title(&browser.status), MUTED)),
+        panes[0],
+    );
+    let Some(issue) = browser.selected() else {
+        return;
+    };
+    let mut preview = vec![
+        Line::styled(
+            format!("#{} {}", issue.number, issue.title.trim()),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        accent(
+            format!(
+                "State: {}  |  Milestone: {}",
+                if issue.state.is_empty() {
+                    "unknown"
+                } else {
+                    issue.state.as_str()
+                },
+                issue
+                    .milestone
+                    .as_ref()
+                    .map_or("none", |m| m.title.as_str())
+            ),
+            OPUS,
+        ),
+    ];
+    if !issue.labels.is_empty() {
+        let names: Vec<&str> = issue.labels.iter().map(|l| l.name.as_str()).collect();
+        preview.push(Line::raw(format!("Labels: {}", names.join(", "))));
+    }
+    preview.push(Line::raw(issue.url.clone()));
+    preview.push(Line::raw(""));
+    let body = issue.body();
+    if body.is_empty() {
+        preview.push(accent("(no description)".into(), MUTED));
+    } else {
+        preview.extend(body.lines().map(|l| Line::raw(l.to_owned())));
+    }
+    paragraph(frame, panes[1], "PREVIEW", preview, CYAN);
+}
+fn status_title(status: &str) -> String {
+    if status.is_empty() {
+        "ISSUES".to_owned()
+    } else {
+        format!("ISSUES  |  {}", shorten(status, 60))
+    }
+}
 fn vt_color(c: vt100::Color) -> Color {
     match c {
         vt100::Color::Default => Color::Reset,
@@ -916,12 +1042,25 @@ fn running(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text=match app.page {
-        Page::Setup=>"Tab switch fields | F2 browse | Ctrl+L clear objective | Enter newline | F5 start | Esc quit".to_owned(),
-        Page::Browser=>"Up/Down browse | Enter folder | S select | Esc back".to_owned(),
-        Page::Running=>if app.close_confirm{"CTRL+Q again to exit and terminate embedded Claude".into()}
-            else{"F4 pause/resume clock | F6 Claude | F8 terminal | F9 tree | F7 attention | Ctrl+Q twice quit".into()},
-        Page::Finished=>"Claude session ended | F10 or Enter new project/objective | Esc quit".into(),
+    let text = match app.page {
+        Page::Setup => {
+            "Tab fields | F2 folders | F3 GitHub issues | Ctrl+L clear | F5 start | Esc quit"
+                .to_owned()
+        }
+        Page::Browser => "Up/Down browse | Enter folder | S select | Esc back".to_owned(),
+        Page::Issues => {
+            "Type filter | Up/Down move | Enter use issue | Ctrl+R refresh | Esc back".to_owned()
+        }
+        Page::Running => {
+            if app.close_confirm {
+                "CTRL+Q again to exit and terminate embedded Claude".into()
+            } else {
+                "F4 pause/resume clock | F6 Claude | F8 terminal | F9 tree | F7 attention | Ctrl+Q twice quit".into()
+            }
+        }
+        Page::Finished => {
+            "Claude session ended | F10 or Enter new project/objective | Esc quit".into()
+        }
     };
     frame.render_widget(
         Paragraph::new(vec![accent(text, CYAN), Line::raw(app.message.clone())])
@@ -961,9 +1100,88 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.page {
         Page::Setup => setup(frame, shell[1], app),
         Page::Browser => browser(frame, shell[1], app),
+        Page::Issues => issues(frame, shell[1], app),
         Page::Running | Page::Finished => running(frame, shell[1], app),
     }
     footer(frame, shell[2], app);
+}
+
+#[cfg(test)]
+mod issue_page_tests {
+    use super::*;
+    use crate::github::{GithubIssue, IssueBrowser, Milestone, RepoRef};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn screen(width: u16, height: u16, app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        buffer.content().iter().map(|c| c.symbol()).collect()
+    }
+    fn app_with_issues() -> App {
+        let mut app = App::new(crate::Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        app.page = Page::Issues;
+        app.issues = IssueBrowser {
+            repo: Some(RepoRef {
+                owner: "acme".into(),
+                name: "tool".into(),
+            }),
+            issues: vec![GithubIssue {
+                number: 38,
+                title: "GitHub Issue selector".into(),
+                body: Some("## Goal\nSelect issues".into()),
+                state: "OPEN".into(),
+                url: "https://github.com/acme/tool/issues/38".into(),
+                milestone: Some(Milestone {
+                    title: "v0.5".into(),
+                }),
+                labels: vec![],
+            }],
+            status: "1 open issue(s) in acme/tool.".into(),
+            ..Default::default()
+        };
+        app
+    }
+    #[test]
+    fn issues_page_renders_list_and_preview_in_narrow_and_wide_terminals() {
+        let app = app_with_issues();
+        let narrow = screen(78, 21, &app);
+        assert!(narrow.contains("#38"), "{narrow}");
+        assert!(narrow.contains("[v0.5]"));
+        assert!(narrow.contains("PREVIEW"));
+        let wide = screen(120, 30, &app);
+        assert!(wide.contains("Select issues"));
+        assert!(wide.contains("Enter use issue"));
+    }
+    #[test]
+    fn hostile_issue_text_never_reaches_the_screen_as_control_codes() {
+        // Goes through parse_issues, the real ingestion path, rather than building the struct directly.
+        let json = r#"[{"number":5,"title":"Evil \u001b]0;pwned\u0007 \u001b[2J","body":"ok\u001b[2J\u001b]52;c;eA==\u0007\u0000 end","state":"OPEN","url":"u","milestone":null,"labels":[]}]"#;
+        let mut app = app_with_issues();
+        app.issues.issues = crate::github::parse_issues(json).unwrap();
+        for (width, height) in [(78, 21), (120, 30)] {
+            let text = screen(width, height, &app);
+            assert!(text.contains("#5"), "{text}");
+            assert!(!text.chars().any(char::is_control), "{text}");
+        }
+    }
+    #[test]
+    fn issues_page_explains_loading_and_empty_states() {
+        let mut app = app_with_issues();
+        app.issues = IssueBrowser {
+            loading: true,
+            status: "Loading open issues from GitHub...".into(),
+            ..Default::default()
+        };
+        assert!(screen(78, 21, &app).contains("Loading open issues"));
+        app.issues.status = "gh failed: boom".into();
+        assert!(screen(78, 21, &app).contains("gh failed: boom"));
+    }
 }
 
 #[cfg(test)]

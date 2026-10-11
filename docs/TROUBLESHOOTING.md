@@ -32,6 +32,75 @@ Press **F6** or **F8** to operate the real Claude terminal. Native permission qu
 
 The activity log depends on records emitted by Claude, which may arrive late. Some Opus advisor usage is not present in the local transcript and is marked unavailable instead of estimated. The objective timer stops when Claude emits a completion signal; **F4** allows a manual pause/resume when that signal is absent.
 
+## GitHub issue objectives
+
+These problems affect **F3** (the Issues page) and `--issue`. Agentree reads issues through the GitHub CLI (`gh`) and never changes them. Nothing here affects normal objectives.
+
+### `gh` not found on PATH
+
+Symptom: "GitHub CLI (`gh`) was not found on PATH."
+
+Cause: the GitHub CLI is not installed, or the terminal was opened before it was added to PATH.
+
+Fix: install it from [cli.github.com](https://cli.github.com), restart Windows Terminal, then check with `Get-Command gh`.
+
+### GitHub CLI not signed in
+
+Symptom: "GitHub CLI is not signed in."
+
+Cause: `gh` has no authenticated account.
+
+Fix: run `gh auth login`, then check the account with `gh auth status`.
+
+### Repository not found or not accessible
+
+Symptom: "owner/repo was not found or is not visible to the account signed in to gh. Private repositories need access."
+
+Cause: the `origin` URL points to a repository that does not exist, or the signed-in account cannot read it. Private repositories need an account with access.
+
+Fix: check `gh auth status` for the account in use, and sign in with an account that can read the repository (`gh auth login`). Confirm the repository with `gh repo view owner/name`.
+
+### Issue number not found
+
+Symptom: "Issue #N was not found."
+
+Cause: the number does not exist in the repository that `origin` points to, or it belongs to another repository.
+
+Fix: check the number against the repository's issue list on GitHub. `--issue` accepts issues in any state, but F3 lists only open issues.
+
+### Network or proxy errors
+
+Symptom: "Could not reach GitHub. Check your network connection or proxy and try again."
+
+Cause: Agentree cannot reach GitHub from this machine.
+
+Fix: check the internet connection and any proxy settings, then press **Ctrl+R** on the Issues page to reload.
+
+### Git "dubious ownership"
+
+Symptom: "git failed: fatal: detected dubious ownership in repository at '...'"
+
+Cause: Git refuses to read a repository owned by another Windows user, so Agentree cannot find its `origin` remote.
+
+Fix: trust the folder for your user, then retry:
+
+```powershell
+git config --global --add safe.directory <path>
+```
+
+### Non-GitHub, missing or ambiguous `origin` remote
+
+Symptoms, depending on the problem:
+
+- "No 'origin' remote (found: ...)"
+- "origin points at different repositories (...). Keep one URL in origin."
+- "origin points at <host>, not github.com."
+- "The project folder is not a Git repository."
+
+Cause: Agentree only uses the `origin` remote, and only github.com remotes. The folder may not be a Git repository, may have no `origin`, may point to a non-GitHub host, or may have several URLs in `origin` that name different repositories. Push-specific URLs are not checked.
+
+Fix: run `git -C <project> remote -v` to see the remotes, and `git -C <project> remote get-url --all origin` to list every URL `origin` uses. Keep one GitHub URL with `git remote set-url origin <url>`, using HTTPS (`https://github.com/owner/repo.git`) or SSH (`git@github.com:owner/repo.git`).
+
 ## Uninstall
 
 From the Agentree source folder:

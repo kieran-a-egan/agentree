@@ -1,3 +1,4 @@
+mod github;
 mod live;
 mod team;
 mod telemetry;
@@ -24,7 +25,9 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, TryRecvError},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 use uuid::Uuid;
@@ -38,6 +41,13 @@ use uuid::Uuid;
 struct Args {
     #[arg(long)]
     project: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "objective",
+        requires = "project",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    issue: Option<u64>,
     #[arg(long)]
     objective: Option<String>,
     #[arg(long)]
@@ -87,14 +97,15 @@ fn path_input(s: &str) -> PathBuf {
 }
 /// How long the PTY queue must stay quiet after Claude exits before finishing.
 const EXIT_DRAIN_GRACE: Duration = Duration::from_millis(300);
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Setup,
     Browser,
+    Issues,
     Running,
     Finished,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Project,
     Objective,
@@ -120,6 +131,7 @@ pub struct App {
     pub browser_dir: PathBuf,
     pub browser_entries: Vec<PathBuf>,
     pub browser_index: usize,
+    pub issues: github::IssueBrowser,
     pub team: team::TeamSnapshot,
     pub telemetry: telemetry::Telemetry,
     pub agent_seen: HashMap<String, Instant>,
@@ -169,7 +181,11 @@ impl App {
                     .display()
                     .to_string()
             });
-        let objective = args.objective.unwrap_or(p.last_objective);
+        // --issue replaces the saved objective, so a failed load cannot start stale text.
+        let objective = match (args.issue, args.objective) {
+            (Some(_), _) => String::new(),
+            (None, objective) => objective.unwrap_or(p.last_objective),
+        };
         let home = data_home();
         let session_id = Uuid::new_v4().to_string();
         let run_dir = home.join("runs").join(&session_id);
@@ -183,6 +199,7 @@ impl App {
             browser_dir: PathBuf::new(),
             browser_entries: vec![],
             browser_index: 0,
+            issues: Default::default(),
             team: Default::default(),
             telemetry: Default::default(),
             agent_seen: HashMap::new(),
@@ -241,6 +258,99 @@ impl App {
             self.browser_entries.extend(sub);
         }
         self.browser_index = 0;
+    }
+    fn open_issues(&mut self) {
+        if !path_input(&self.project).is_dir() {
+            self.message = "Choose an existing project folder before browsing issues.".into();
+            return;
+        }
+        self.issues = Default::default();
+        self.issues.status = "Loading open issues from GitHub...".into();
+        self.page = Page::Issues;
+        self.start_load(github::browse);
+    }
+    /// Runs `gh` and `git` off the UI thread. Replacing `issues.rx` drops any earlier, stale load.
+    fn start_load<F>(&mut self, load: F)
+    where
+        F: FnOnce(&Path) -> Result<github::Loaded, github::Error> + Send + 'static,
+    {
+        let project = path_input(&self.project);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(load(&project));
+        });
+        self.issues.rx = Some(rx);
+        self.issues.loading = true;
+    }
+    fn poll_issues(&mut self) {
+        let received = match self.issues.rx.as_ref() {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        let result = match received {
+            Err(TryRecvError::Empty) => return,
+            Ok(result) => result,
+            Err(TryRecvError::Disconnected) => {
+                self.issues.rx = None;
+                self.issues.loading = false;
+                self.issues.status = "The GitHub lookup stopped unexpectedly.".into();
+                return;
+            }
+        };
+        self.issues.rx = None;
+        self.issues.loading = false;
+        match result {
+            Ok(github::Loaded::Browse { repo, issues }) => {
+                self.issues.status = if issues.is_empty() {
+                    format!("No open issues in {}.", repo.slug())
+                } else if issues.len() >= github::OPEN_ISSUE_LIMIT {
+                    format!(
+                        "Showing the first {} open issues in {}.",
+                        github::OPEN_ISSUE_LIMIT,
+                        repo.slug()
+                    )
+                } else {
+                    format!("{} open issue(s) in {}.", issues.len(), repo.slug())
+                };
+                self.issues.repo = Some(repo);
+                self.issues.issues = issues;
+                self.issues.index = 0;
+            }
+            Ok(github::Loaded::Single { repo, issue }) => {
+                if self.objective.trim().is_empty() {
+                    self.adopt_issue(&repo, &issue);
+                } else {
+                    self.message = format!(
+                        "Issue #{} loaded, but the objective already has text. Press F3 to pick it.",
+                        issue.number
+                    );
+                }
+            }
+            Err(error) => match self.page {
+                Page::Issues => self.issues.status = error.to_string(),
+                _ => self.message = error.to_string(),
+            },
+        }
+    }
+    /// Startup path for `--issue`: loads in the background, then fills the objective for review.
+    fn preselect_issue(&mut self, number: u64) {
+        self.message = format!("Loading issue #{number} from GitHub...");
+        self.start_load(move |project| github::single(project, number));
+    }
+    fn adopt_issue(&mut self, repo: &github::RepoRef, issue: &github::GithubIssue) {
+        let replaced = !self.objective.trim().is_empty();
+        self.objective = github::objective_from_issue(repo, issue);
+        self.focus = Focus::Objective;
+        self.message = format!(
+            "Objective from {}#{}{}. Review or edit it, then press F5 to start.",
+            repo.slug(),
+            issue.number,
+            if replaced {
+                " (replaced previous text)"
+            } else {
+                ""
+            }
+        );
     }
     fn start(&mut self, area: ratatui::layout::Rect) -> Result<()> {
         let project = path_input(&self.project)
@@ -305,6 +415,9 @@ impl App {
         }
         self.page = Page::Running;
         self.focus = Focus::Native;
+        // A late --issue or picker result must not overwrite the running session's status.
+        self.issues.rx = None;
+        self.issues.loading = false;
         self.terminal_expanded = false;
         self.output_end = false;
         self.close_confirm = false;
@@ -323,6 +436,7 @@ impl App {
         Ok(())
     }
     fn poll(&mut self, area: ratatui::layout::Rect) {
+        self.poll_issues();
         if self.page != Page::Running {
             return;
         }
@@ -533,6 +647,7 @@ impl App {
                 match key.code {
                     KeyCode::Esc => return true,
                     KeyCode::F(2) => self.browser_open(),
+                    KeyCode::F(3) => self.open_issues(),
                     KeyCode::F(5) => {
                         if let Err(e) = self.start(area) {
                             self.message = e.to_string();
@@ -598,6 +713,38 @@ impl App {
                 KeyCode::Char('s') | KeyCode::F(5) => {
                     self.project = self.browser_dir.display().to_string();
                     self.page = Page::Setup;
+                }
+                _ => (),
+            },
+            Page::Issues => match key.code {
+                KeyCode::Esc => {
+                    self.issues.rx = None;
+                    self.issues.loading = false;
+                    self.page = Page::Setup;
+                    self.message = "Issue selection cancelled. The objective is unchanged.".into();
+                }
+                KeyCode::Enter => {
+                    if let (Some(repo), Some(issue)) =
+                        (self.issues.repo.clone(), self.issues.selected().cloned())
+                    {
+                        self.adopt_issue(&repo, &issue);
+                        self.page = Page::Setup;
+                    }
+                }
+                KeyCode::Up => self.issues.move_by(-1),
+                KeyCode::Down => self.issues.move_by(1),
+                KeyCode::PageUp => self.issues.move_by(-10),
+                KeyCode::PageDown => self.issues.move_by(10),
+                KeyCode::Char('r' | 'R') if ctrl => self.open_issues(),
+                KeyCode::Backspace => {
+                    let mut filter = self.issues.filter.clone();
+                    filter.pop();
+                    self.issues.set_filter(filter);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    let mut filter = self.issues.filter.clone();
+                    filter.push(c);
+                    self.issues.set_filter(filter);
                 }
                 _ => (),
             },
@@ -755,7 +902,11 @@ impl Drop for Reset {
     }
 }
 fn dashboard(args: Args) -> Result<()> {
+    let issue = args.issue;
     let mut app = App::new(args);
+    if let Some(number) = issue {
+        app.preselect_issue(number);
+    }
     enable_raw_mode().context("Switching terminal to raw input")?;
     let _reset = Reset;
     let mut stdout = io::stdout();
@@ -800,6 +951,7 @@ mod tests {
     fn run_clock_can_be_frozen_without_stopping_claude() {
         let mut a = App::new(Args {
             project: None,
+            issue: None,
             objective: None,
             demo: true,
         });
@@ -807,9 +959,77 @@ mod tests {
         assert_eq!(a.run_elapsed(), Duration::from_secs(42));
     }
     #[test]
+    fn issue_flag_conflicts_with_objective_and_requires_project() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("agentree").chain(args.iter().copied()))
+        };
+        assert!(parse(&["--project", "C:/r", "--issue", "38", "--objective", "x"]).is_err());
+        assert!(parse(&["--issue", "38"]).is_err());
+        assert!(parse(&["--project", "C:/r", "--issue", "0"]).is_err());
+        let ok = parse(&["--project", "C:/r", "--issue", "38"]).unwrap();
+        assert_eq!(ok.issue, Some(38));
+        assert!(parse(&["--project", "C:/r", "--objective", "x"])
+            .unwrap()
+            .issue
+            .is_none());
+    }
+    #[test]
+    fn issue_startup_never_restores_saved_objective() {
+        let a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: Some(38),
+            objective: None,
+            demo: true,
+        });
+        assert!(a.objective.is_empty());
+        assert_eq!(a.page, Page::Setup);
+    }
+    #[test]
+    fn explicit_objective_still_prefills_setup() {
+        let a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: Some("Ship the picker".into()),
+            demo: true,
+        });
+        assert_eq!(a.objective, "Ship the picker");
+        assert_eq!(a.page, Page::Setup);
+        assert_eq!(a.focus, Focus::Project);
+    }
+    #[test]
+    fn adopting_an_issue_fills_objective_for_review_without_starting() {
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: Some("old text".into()),
+            demo: true,
+        });
+        let repo = github::RepoRef {
+            owner: "acme".into(),
+            name: "tool".into(),
+        };
+        let issue = github::GithubIssue {
+            number: 9,
+            title: "Title".into(),
+            body: Some("Body".into()),
+            state: "OPEN".into(),
+            url: "https://github.com/acme/tool/issues/9".into(),
+            milestone: None,
+            labels: vec![],
+        };
+        a.adopt_issue(&repo, &issue);
+        assert!(a.objective.starts_with("Work on GitHub issue acme/tool#9."));
+        assert!(a.objective.contains("Title: Title\n"));
+        assert_eq!(a.focus, Focus::Objective);
+        assert!(a.message.contains("replaced previous text"));
+        assert!(a.session.is_none());
+        assert_eq!(a.page, Page::Setup);
+    }
+    #[test]
     fn empty_objective_does_not_start() {
         let args = Args {
             project: Some(std::env::current_dir().unwrap()),
+            issue: None,
             objective: Some(String::new()),
             demo: true,
         };

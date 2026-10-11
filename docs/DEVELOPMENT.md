@@ -4,7 +4,7 @@ Agentree is a native Windows Rust terminal application. It uses `ratatui` and `c
 
 ## Run from source
 
-Prerequisites: Windows, an installed and authenticated Claude Code CLI, Git, and Rust/Cargo.
+Prerequisites: Windows, an installed and authenticated Claude Code CLI, Git, and Rust/Cargo. The GitHub CLI (`gh`) is optional and is needed only for GitHub issue objectives.
 
 ```powershell
 cargo test
@@ -53,6 +53,7 @@ Before merging a change to the launcher or terminal UI, additionally smoke-test 
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
 | `src/live.rs` | Observed terminal activity and review/completion signals |
 | `src/prompt.rs` | Team and escalation instructions given to Claude |
+| `src/github.rs` | GitHub remote discovery, read-only `gh` issue loading, and issue-to-objective generation |
 
 The versioned event contract, including how unknown usage is represented, is documented in `docs/EVENT_SCHEMA.md`. Claude-specific parsing belongs in the adapters (`telemetry.rs`, `team.rs`); new dashboard code should consume `model` types rather than Claude file formats.
 
