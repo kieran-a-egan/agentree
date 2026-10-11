@@ -18,6 +18,8 @@ Agentree currently provides a Windows Ratatui dashboard, embedded Claude Code th
 
 ## v0.5 — Configuration & core contracts
 
+**Status:** Implementation complete (#1–#5, #38); release gate #6 verified by `release_gate_*` tests and the checklist in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md#v05-release-gate).
+
 **Outcome:** Models and run policies are configurable without editing Rust prompts.
 
 - Settings screen for each role: **lead, planner, explorer, researcher, coder, tester, advisor and final reviewer**.

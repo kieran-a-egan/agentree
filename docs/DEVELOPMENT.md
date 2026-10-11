@@ -41,6 +41,17 @@ Use the checked-in `Cargo.lock`; dependency changes must update it intentionally
 
 Before merging a change to the launcher or terminal UI, additionally smoke-test **on a developer's Windows machine with Claude signed in**: launch `agentree`, start an objective, verify the terminal accepts input and permission prompts, observe a named teammate in the dashboard, and ensure review/completion markers and exit cleanup still work. GitHub CI can't validate those third-party interactive behaviours without live credentials.
 
+## v0.5 release gate
+
+Automated, run by CI: `capability::tests::release_gate_model_change_persists_and_launches` saves a role model to `profiles.json`, reloads it as a restart would, and checks the model reaches the launch flags and teammate instructions and that unsupported values fail `preflight`. `roles_overlay_*` tests in `src/main.rs` cover the UI edit-and-save path, and `profiles::tests` cover migration from `roles.json`.
+
+Manual, on a Windows machine with Claude signed in (CI has no credentials):
+
+1. `cargo test --locked -- --ignored --nocapture installed_cli` prints the capability matrix and passes.
+2. Start `agentree`, press **F4**, change the Lead model, close the overlay, quit and restart. The overlay shows the saved model.
+3. Start an objective. The Claude session starts with the chosen model, and teammates appear in the dashboard.
+4. Choose a setting the installed Claude Code does not accept (for example by running an older CLI). **F5** opens the capability matrix and nothing is launched.
+
 ## Components
 
 | Source | Purpose |

@@ -96,7 +96,7 @@ fn claude_team_env(plan: &RolePlan) -> Vec<(&'static str, String)> {
     env
 }
 
-fn claude_launch_args(
+pub(crate) fn claude_launch_args(
     plan: &RolePlan,
     session_id: &str,
     policy: &Path,

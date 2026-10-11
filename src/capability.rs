@@ -378,6 +378,54 @@ mod tests {
         d
     }
 
+    /// v0.5 release gate: a model chosen for a stage is saved, survives a restart, reaches the
+    /// launch arguments and instructions, and an unsupported setting is refused before launch.
+    #[test]
+    fn release_gate_model_change_persists_and_launches() {
+        use crate::profiles::{self, Store};
+        use crate::roles::{Field, Role};
+        let dir = std::env::temp_dir().join(format!("agentree-gate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (file, legacy) = (dir.join("profiles.json"), dir.join("roles.json"));
+
+        let mut store = Store::default();
+        store
+            .set_profile_value(Role::Lead, Field::Model, "claude-sonnet-5-5")
+            .unwrap();
+        store
+            .set_profile_value(Role::Coder, Field::Model, "claude-sonnet-5-5")
+            .unwrap();
+        // A value outside the offered list is rejected at the setting, before it can be saved.
+        assert!(store
+            .set_profile_value(Role::Lead, Field::Model, "gpt-4")
+            .is_err());
+        store.save(&file).unwrap();
+
+        // Restart: a fresh load resolves the same choices for any project.
+        let (reloaded, notices) = profiles::load(&file, &legacy);
+        assert!(notices.is_empty(), "{notices:?}");
+        let plan = reloaded.effective("any-project").plan();
+        assert_eq!(plan.lead_model, "claude-sonnet-5-5");
+        assert!(preflight(&plan, &matrix(Status::Supported)).is_empty());
+
+        // The saved choice is what runs: launch flag and the teammate instructions.
+        let args: Vec<String> = crate::pty::claude_launch_args(&plan, "run", Path::new("p"), "go")
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&args[..2], ["--model", "claude-sonnet-5-5"]);
+        let policy = crate::prompt::system_policy(Path::new("a.json"), "run", &plan);
+        assert!(policy.contains("- Coder: claude-sonnet-5-5"), "{policy}");
+
+        // Unsupported settings fail preflight, so nothing is spawned.
+        let mut bad = plan.clone();
+        bad.lead_model = "gpt-4".into();
+        assert!(!preflight(&bad, &matrix(Status::Supported)).is_empty());
+        assert!(!preflight(&plan, &with_unsupported("--model")).is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn parse_errors_classify_flags() {
         assert_eq!(
