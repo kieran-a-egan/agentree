@@ -1,3 +1,4 @@
+use crate::capability::Status;
 use crate::model::EventKind;
 use crate::scroll::Pane;
 use crate::{App, Attention, Focus, Page};
@@ -1221,7 +1222,7 @@ fn running(frame: &mut Frame, body: Rect, app: &App) {
 fn footer(frame: &mut Frame, area: Rect, app: &App) {
     let text = match app.page {
         Page::Setup => {
-            "F1 controls | Tab | F2 folders | F3 issues | Ctrl+L clear | F5 start | Esc".to_owned()
+            "F1 controls | Tab | F2 folders | F3 issues | F7 CLI check | F5 start | Esc".to_owned()
         }
         Page::Browser => {
             "F1 controls | Up/Down browse | Enter folder | S select | Esc back".to_owned()
@@ -1264,6 +1265,7 @@ fn help_lines() -> Vec<Line<'static>> {
         section("SETUP"),
         Line::raw("  Tab switch project/objective    Ctrl+Up/Down scroll the objective"),
         Line::raw("  F2 folders   F3 GitHub issues   F5 start   Ctrl+L clear   Esc quit"),
+        Line::raw("  F7 check the Claude Code CLI: capabilities and launch plan"),
         section("GITHUB ISSUES"),
         Line::raw("  Up/Down PgUp/PgDn select; the list follows the selection"),
         Line::raw("  Tab moves Ctrl+scroll between the list and the preview"),
@@ -1305,6 +1307,83 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
         help_lines(),
     );
 }
+fn capabilities_rect(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(92);
+    let height = area.height.saturating_sub(2).clamp(4, 30);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+/// The launch plan first, then every probed or static capability. Notes sit on their own line
+/// so they stay readable at 78 columns; the pane wraps anything longer than its width.
+fn capabilities_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(discovery) = &app.capabilities else {
+        return vec![accent(
+            "Press F7 on Setup to check the installed Claude Code CLI.".into(),
+            MUTED,
+        )];
+    };
+    let section = |title: &str| accent(title.to_owned(), ORANGE);
+    let mut out = vec![section("LAUNCH PLAN")];
+    if app.launch_problems.is_empty() {
+        out.push(accent(
+            "Ready: default Claude plan passes preflight.".into(),
+            Color::Green,
+        ));
+    } else {
+        for d in &app.launch_problems {
+            out.push(Line::styled(
+                d.capability.clone(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ));
+            out.push(Line::raw(format!("  {}", d.problem)));
+            out.push(Line::raw(format!("  Fix: {}", d.fix)));
+        }
+    }
+    out.push(Line::raw(""));
+    out.push(section("BACKEND CAPABILITIES"));
+    out.push(Line::raw(format!(
+        "CLI: {}",
+        discovery
+            .cli
+            .as_deref()
+            .unwrap_or("no Claude Code CLI found")
+    )));
+    let width = discovery
+        .rows
+        .iter()
+        .map(|r| r.capability.chars().count())
+        .max()
+        .unwrap_or(0);
+    for row in &discovery.rows {
+        let color = match row.status {
+            Status::Supported => Color::Green,
+            Status::Unsupported => Color::Red,
+            Status::Unverified => Color::Yellow,
+        };
+        out.push(Line::from(vec![
+            Span::raw(format!("{:<width$}  ", row.capability)),
+            Span::styled(row.status.label(), Style::default().fg(color)),
+        ]));
+        out.push(accent(format!("    {}", row.note), MUTED));
+    }
+    out
+}
+fn capabilities(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    pane(
+        frame,
+        area,
+        app,
+        Pane::Capabilities,
+        "CAPABILITIES  |  F7 or Esc close",
+        CYAN,
+        capabilities_lines(app),
+    );
+}
 
 /// Every pane on the current page, with its rectangle. Mouse hit-testing reads this, and
 /// `draw` lays out from the same helpers, so they agree on what is on screen.
@@ -1340,6 +1419,9 @@ pub fn regions(area: Rect, app: &App) -> Vec<(Pane, Rect)> {
     out.push((Pane::Footer, shell[2]));
     if app.help_open {
         out.push((Pane::Help, help_rect(area)));
+    }
+    if app.capabilities_open {
+        out.push((Pane::Capabilities, capabilities_rect(area)));
     }
     out
 }
@@ -1380,6 +1462,9 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.help_open {
         help(frame, help_rect(area), app);
     }
+    if app.capabilities_open {
+        capabilities(frame, capabilities_rect(area), app);
+    }
 }
 
 #[cfg(test)]
@@ -1388,7 +1473,7 @@ mod issue_page_tests {
     use crate::github::{GithubIssue, IssueBrowser, Milestone, RepoRef};
     use ratatui::{backend::TestBackend, Terminal};
 
-    fn screen(width: u16, height: u16, app: &App) -> String {
+    pub(super) fn screen(width: u16, height: u16, app: &App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
         let buffer = terminal.backend().buffer().clone();
@@ -1457,6 +1542,91 @@ mod issue_page_tests {
         assert!(screen(78, 21, &app).contains("Loading open issues"));
         app.issues.status = "gh failed: boom".into();
         assert!(screen(78, 21, &app).contains("gh failed: boom"));
+    }
+}
+
+#[cfg(test)]
+mod capability_overlay_tests {
+    use super::issue_page_tests::screen;
+    use super::*;
+    use crate::capability::{Diagnostic, Discovery, Row};
+
+    fn app_with_overlay() -> App {
+        let mut app = App::new(crate::Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        app.capabilities = Some(Discovery {
+            cli: Some("C:/tools/claude.exe".into()),
+            rows: vec![
+                Row {
+                    capability: "Advisor (--advisor)".into(),
+                    flag: Some("--advisor"),
+                    status: Status::Unsupported,
+                    note: "the CLI rejects this flag".into(),
+                },
+                Row {
+                    capability: "Model selection (--model)".into(),
+                    flag: Some("--model"),
+                    status: Status::Supported,
+                    note: "accepted by the CLI".into(),
+                },
+            ],
+        });
+        app.capabilities_open = true;
+        app
+    }
+    #[test]
+    fn overlay_lists_rows_at_minimum_and_large_sizes() {
+        let app = app_with_overlay();
+        for (width, height) in [(78, 21), (140, 40)] {
+            let text = screen(width, height, &app);
+            assert!(text.contains("CAPABILITIES"), "{text}");
+            assert!(text.contains("NOT SUPPORTED"), "{text}");
+            assert!(text.contains("supported"), "{text}");
+        }
+    }
+    #[test]
+    fn overlay_reports_ready_or_the_blocking_problem() {
+        let mut app = app_with_overlay();
+        assert!(screen(140, 40, &app).contains("Ready:"));
+        app.launch_problems = vec![Diagnostic {
+            capability: "Advisor".into(),
+            problem: "Claude Code rejects --advisor.".into(),
+            fix: "Update Claude Code, then press F5 again.".into(),
+        }];
+        let text = screen(140, 40, &app);
+        assert!(!text.contains("Ready:"), "{text}");
+        assert!(text.contains("Claude Code rejects --advisor."), "{text}");
+    }
+    #[test]
+    fn overlay_never_says_ready_without_a_cli() {
+        let mut app = app_with_overlay();
+        let discovery = crate::capability::discover(None);
+        app.launch_problems = crate::capability::preflight(
+            &crate::capability::RolePlan::claude_default(),
+            &discovery,
+        );
+        app.capabilities = Some(discovery);
+        let text = screen(140, 40, &app);
+        assert!(!text.contains("Ready:"), "{text}");
+        assert!(text.contains("No Claude Code CLI was found."), "{text}");
+    }
+    #[test]
+    fn overlay_asks_for_a_check_before_discovery_has_run() {
+        let mut app = app_with_overlay();
+        app.capabilities = None;
+        assert!(screen(78, 21, &app).contains("Press F7 on Setup"));
+    }
+    #[test]
+    fn overlay_is_hidden_until_opened_and_footer_names_the_key() {
+        let mut app = app_with_overlay();
+        app.capabilities_open = false;
+        let text = screen(78, 21, &app);
+        assert!(!text.contains("CAPABILITIES"), "{text}");
+        assert!(text.contains("F7 CLI check"), "{text}");
     }
 }
 

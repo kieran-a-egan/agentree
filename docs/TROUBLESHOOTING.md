@@ -20,6 +20,16 @@ claude
 
 Complete any folder-trust prompt, exit Claude, and retry Agentree. If it still stalls, see the session's `startup-status.json` under `%LOCALAPPDATA%\ClaudeAgentTree\runs\`. The installer also supports `-ClaudeCli "C:\path\to\claude.exe"` if you need to select a different Claude installation.
 
+## Launch blocked by a capability check
+
+Pressing **F5** shows `Launch blocked: ...` when the installed Claude Code CLI lacks a flag Agentree needs, or the launch plan names an unknown model. Nothing is saved or started. The capability matrix opens automatically; press **F7** on the setup screen to see it again.
+
+Cause: most often an older Claude Code build. Hidden flags such as `--advisor` and `--teammate-mode` are not listed in `claude --help`, so check the matrix rather than the help text.
+
+Fix: run `claude update`, confirm `claude --version`, then press **F5** again. If several CLIs are installed, `CLAUDE_TREE_REAL_CLAUDE` or `install.ps1 -ClaudeCli` selects the one Agentree uses. The matrix shows which path was probed.
+
+`unverified` rows in the matrix are not failures. They can only be confirmed in a live session.
+
 ## Teammates are missing from the dashboard
 
 Claude may run named teammates, background subagents, or no parallel workers, depending on the task and available tools. Agentree only links a native team when the local Claude records match the active project/session with sufficient confidence. Check the embedded Claude terminal before assuming work has stopped.

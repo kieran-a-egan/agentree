@@ -28,9 +28,10 @@ pub enum Pane {
     Attention,
     Footer,
     Help,
+    Capabilities,
 }
 impl Pane {
-    pub const ALL: [Pane; 20] = [
+    pub const ALL: [Pane; 21] = [
         Pane::Project,
         Pane::Objective,
         Pane::Recent,
@@ -51,6 +52,7 @@ impl Pane {
         Pane::Attention,
         Pane::Footer,
         Pane::Help,
+        Pane::Capabilities,
     ];
     /// Dashboard panes in the order F5 cycles through them.
     pub const DASHBOARD: [Pane; 8] = [
