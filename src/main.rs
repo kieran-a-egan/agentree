@@ -8,6 +8,7 @@ mod telemetry;
 #[allow(dead_code)]
 // Approval/Run/Stage have no runtime consumer until v0.6+; tests pin the wire format.
 mod model;
+mod profiles;
 mod prompt;
 mod pty;
 mod roles;
@@ -67,17 +68,32 @@ struct Prefs {
 }
 
 fn data_home() -> PathBuf {
-    if let Some(p) = std::env::var_os("LOCALAPPDATA") {
-        PathBuf::from(p).join("ClaudeAgentTree")
-    } else {
-        std::env::temp_dir().join("ClaudeAgentTree")
+    // Tests never read or write the user's saved settings, prefs or runs.
+    #[cfg(test)]
+    {
+        static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| {
+            std::env::temp_dir().join(format!("agentree-test-home-{}", Uuid::new_v4()))
+        })
+        .clone()
+    }
+    #[cfg(not(test))]
+    {
+        match std::env::var_os("LOCALAPPDATA") {
+            Some(p) => PathBuf::from(p).join("ClaudeAgentTree"),
+            None => std::env::temp_dir().join("ClaudeAgentTree"),
+        }
     }
 }
 fn prefs_path() -> PathBuf {
     data_home().join("prefs.json")
 }
-fn roles_path() -> PathBuf {
+/// Role settings as saved by versions before profiles. Read once to migrate, never written.
+fn legacy_roles_path() -> PathBuf {
     data_home().join("roles.json")
+}
+fn profiles_path() -> PathBuf {
+    data_home().join("profiles.json")
 }
 fn read_prefs() -> Prefs {
     fs::read_to_string(prefs_path())
@@ -196,17 +212,25 @@ pub struct App {
     pub capabilities_open: bool,
     /// Proven problems with the launch plan against `capabilities`. Empty means it may launch.
     pub launch_problems: Vec<capability::Diagnostic>,
-    /// Per-role model choices from `roles.json`. Only changed on Setup, so a running session always matches them.
+    /// The settings a launch uses: the project's profile with its overrides applied. Only changed
+    /// on Setup, so a running session always matches them.
     pub role_settings: roles::Settings,
-    /// Problems found while loading or sanitizing `roles.json`, shown in the Roles overlay.
+    /// Saved profiles and per-project choices from `profiles.json`.
+    pub profiles: profiles::Store,
+    /// Problems found while loading or sanitizing `profiles.json`, shown in the Roles overlay.
     pub role_notices: Vec<String>,
+    /// Whether the Roles overlay edits this project's overrides (`true`) or the active profile.
+    pub roles_project_scope: bool,
+    /// The `project` text `role_settings` was resolved for, and the key it resolved under.
+    settings_for: String,
+    pub settings_key: String,
     /// F4 on Setup. Keys go to the overlay, not Claude, while it is open.
     pub roles_open: bool,
     /// Index into `roles::ROLES` for the overlay's selected row.
     pub roles_row: usize,
     pub roles_field: roles::Field,
-    /// Where `role_settings` is saved. Tests point this at a temporary file.
-    roles_file: PathBuf,
+    /// Where `profiles` is saved. Tests point this at a temporary file.
+    profiles_file: PathBuf,
 }
 impl App {
     fn new(args: Args) -> Self {
@@ -229,11 +253,13 @@ impl App {
         let home = data_home();
         let session_id = Uuid::new_v4().to_string();
         let run_dir = home.join("runs").join(&session_id);
-        let (role_settings, role_notices) = roles::load(&roles_path());
+        let (profiles, role_notices) = profiles::load(&profiles_path(), &legacy_roles_path());
+        let settings_key = profiles::project_key(&path_input(&project));
+        let role_settings = profiles.effective(&settings_key);
         Self {
             page: Page::Setup,
             focus: Focus::Project,
-            project,
+            project: project.clone(),
             objective,
             message: role_notices.first().cloned().unwrap_or_default(),
             recent: p.projects,
@@ -279,21 +305,53 @@ impl App {
             capabilities: None,
             capabilities_open: false,
             launch_problems: Vec::new(),
+            settings_for: project,
+            settings_key,
             role_settings,
+            profiles,
             role_notices,
+            roles_project_scope: false,
             roles_open: false,
             roles_row: 0,
             roles_field: roles::Field::Model,
-            roles_file: roles_path(),
+            profiles_file: profiles_path(),
         }
     }
     fn refresh_capabilities(&mut self, discovery: capability::Discovery) {
         self.launch_problems = capability::preflight(&self.role_settings.plan(), &discovery);
         self.capabilities = Some(discovery);
     }
-    /// Writes `roles.json` after a change. A failed write is reported, not hidden, and the choice stays in memory.
-    fn save_roles(&mut self) {
-        match roles::save(&self.roles_file, &self.role_settings) {
+    /// The settings the Roles overlay shows: those of the layer it edits. In global scope that is
+    /// the active profile even when the project pins another, so an edit is always visible;
+    /// `role_settings` stays what launches.
+    pub fn roles_view(&self) -> roles::Settings {
+        if self.roles_project_scope {
+            self.role_settings.clone()
+        } else {
+            self.profiles.active_settings()
+        }
+    }
+    /// The key `profiles` stores this project's choices under.
+    fn project_id(&self) -> String {
+        profiles::project_key(&path_input(&self.project))
+    }
+    /// Re-resolves `role_settings` when the project text has changed. Only on Setup, so a
+    /// running session keeps the settings it launched with.
+    fn sync_roles(&mut self) {
+        if self.page == Page::Setup && self.settings_for != self.project {
+            self.resolve_roles();
+        }
+    }
+    fn resolve_roles(&mut self) {
+        self.settings_for = self.project.clone();
+        self.settings_key = self.project_id();
+        self.role_settings = self.profiles.effective(&self.settings_key);
+    }
+    /// Resolves settings for the current project and writes `profiles.json` after a change. A
+    /// failed write is reported, not hidden, and the choice stays in memory.
+    fn apply_profiles(&mut self) {
+        self.resolve_roles();
+        match self.profiles.save(&self.profiles_file) {
             Ok(()) => self.role_notices.clear(),
             Err(error) => self.message = format!("Role settings were not saved: {error}"),
         }
@@ -303,6 +361,8 @@ impl App {
             .iter()
             .position(|f| *f == self.roles_field)
             .unwrap_or(0);
+        let project = self.project_id();
+        let scoped = self.roles_project_scope;
         match key.code {
             KeyCode::Esc | KeyCode::F(4) => self.roles_open = false,
             KeyCode::Up => self.roles_row = self.roles_row.saturating_sub(1),
@@ -314,6 +374,19 @@ impl App {
                 self.roles_field =
                     roles::FIELDS[(field_index + roles::FIELDS.len() - 1) % roles::FIELDS.len()]
             }
+            KeyCode::Char('s' | 'S') => self.roles_project_scope = !scoped,
+            KeyCode::Char(c @ ('p' | 'P')) => {
+                let step = if c == 'p' { 1 } else { -1 };
+                if !scoped {
+                    self.profiles.cycle_active(step);
+                } else if project.is_empty() {
+                    self.message = "Choose a project folder first.".into();
+                    return;
+                } else {
+                    self.profiles.cycle_project_profile(&project, step);
+                }
+                self.apply_profiles();
+            }
             KeyCode::Right | KeyCode::Left => {
                 let step = if key.code == KeyCode::Right { 1 } else { -1 };
                 let role = roles::ROLES[self.roles_row];
@@ -324,15 +397,36 @@ impl App {
                         self.roles_field.label(),
                         roles::not_applicable_reason(role, self.roles_field)
                     );
+                    return;
+                }
+                // Step from the layer being edited, so the value shown is the value changed.
+                let mut next = if scoped {
+                    self.profiles.effective(&project)
                 } else {
-                    self.role_settings.cycle(role, self.roles_field, step);
-                    self.save_roles();
+                    self.profiles.active_settings()
+                };
+                next.cycle(role, self.roles_field, step);
+                let value = next.value(role, self.roles_field);
+                let saved = if scoped {
+                    self.profiles
+                        .set_override(&project, role, self.roles_field, &value)
+                } else {
+                    self.profiles
+                        .set_profile_value(role, self.roles_field, &value)
+                };
+                match saved {
+                    Ok(()) => self.apply_profiles(),
+                    Err(why) => self.message = why,
                 }
             }
             KeyCode::Char('d' | 'D') => {
                 let role = roles::ROLES[self.roles_row];
-                self.role_settings.reset(role);
-                self.save_roles();
+                if scoped {
+                    self.profiles.clear_overrides(&project, role);
+                } else {
+                    self.profiles.reset_profile_role(role);
+                }
+                self.apply_profiles();
             }
             _ => {}
         }
@@ -534,6 +628,11 @@ impl App {
         } else {
             Some(pty::cli_path()?)
         };
+        // The launch uses this project's profile and overrides, resolved for the folder as it is
+        // now, so a typed path that differs only in form still finds its saved choices.
+        self.settings_key = profiles::project_key(&project);
+        self.role_settings = self.profiles.effective(&self.settings_key);
+        self.settings_for = self.project.clone();
         // Validate the plan before anything is saved or spawned. Demo mode launches nothing.
         if let Some(cli) = &cli {
             self.check_launch(capability::discover(Some(cli)))?;
@@ -610,6 +709,7 @@ impl App {
         Ok(())
     }
     fn poll(&mut self, area: ratatui::layout::Rect) {
+        self.sync_roles();
         self.poll_issues();
         if self.page != Page::Running {
             return;
@@ -1629,18 +1729,21 @@ mod tests {
             .trim_end()
             .to_owned()
     }
-    /// Setup with default role settings saved to a temporary file, never the user's `roles.json`.
+    /// Setup with the built-in profiles saved to a temporary file, never the user's `profiles.json`.
     fn roles_app() -> (App, PathBuf) {
         let dir = std::env::temp_dir().join(format!("agentree-app-roles-{}", Uuid::new_v4()));
-        let file = dir.join("roles.json");
+        let file = dir.join("profiles.json");
         let mut a = App::new(Args {
             project: Some(std::env::current_dir().unwrap()),
             issue: None,
             objective: None,
             demo: true,
         });
-        a.roles_file = file;
+        a.profiles_file = file;
+        a.profiles = profiles::Store::default();
         a.role_settings = roles::Settings::default();
+        a.settings_for = a.project.clone();
+        a.settings_key = a.project_id();
         a.role_notices.clear();
         (a, dir)
     }
@@ -1654,7 +1757,8 @@ mod tests {
         assert_eq!(a.roles_field, roles::Field::Effort);
         a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
         assert_eq!(a.role_settings.plan().effort.as_deref(), Some("low"));
-        assert_eq!(roles::load(&a.roles_file).0.lead.effort, "low");
+        let saved = profiles::load(&a.profiles_file, &dir.join("roles.json")).0;
+        assert_eq!(saved.active_settings().lead.effort, "low");
         // Keys stay in the overlay: the Setup objective is untouched.
         let objective = a.objective.clone();
         a.handle(key(KeyCode::Char('x'), KeyModifiers::NONE), AREA);
@@ -1676,7 +1780,7 @@ mod tests {
             "{}",
             a.message
         );
-        assert!(!a.roles_file.exists());
+        assert!(!a.profiles_file.exists());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1690,6 +1794,90 @@ mod tests {
         assert_eq!(a.role_settings.coder.concurrency, 4);
         a.handle(key(KeyCode::Char('d'), KeyModifiers::NONE), AREA);
         assert_eq!(a.role_settings.coder, roles::Settings::default().coder);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn roles_overlay_switches_profile_and_edits_project_overrides() {
+        let (mut a, dir) = roles_app();
+        let id = a.project_id();
+        a.roles_open = true;
+        let press = |a: &mut App, code| {
+            a.handle(key(code, KeyModifiers::NONE), AREA);
+        };
+        // Global: p moves the active profile, and the settings follow it.
+        press(&mut a, KeyCode::Char('p'));
+        assert_eq!(a.profiles.active, "Local");
+        assert_eq!(a.role_settings.plan().advisor, None);
+        press(&mut a, KeyCode::Char('P'));
+        assert_eq!(a.profiles.active, "Balanced");
+
+        // Project scope: an override changes this project and leaves the profile alone.
+        press(&mut a, KeyCode::Char('s'));
+        assert!(a.roles_project_scope);
+        a.roles_field = roles::Field::Effort;
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.role_settings.lead.effort, "low");
+        assert_eq!(a.profiles.active_settings().lead.effort, "");
+        assert!(a.profiles.has_overrides(&id, roles::Role::Lead));
+
+        // Pin a profile for the project; the override still wins over it.
+        press(&mut a, KeyCode::Char('p'));
+        assert_eq!(a.profiles.profile_name(&id), "Budget");
+        assert_eq!(a.profiles.active, "Balanced");
+
+        // Everything survives a restart.
+        let (back, _) = profiles::load(&a.profiles_file, &dir.join("roles.json"));
+        assert_eq!(back.effective(&id), a.role_settings);
+
+        // d clears the role's overrides only; leaving scope edits the profile again.
+        press(&mut a, KeyCode::Char('d'));
+        assert!(!a.profiles.has_overrides(&id, roles::Role::Lead));
+        press(&mut a, KeyCode::Char('s'));
+        assert!(!a.roles_project_scope);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn global_edits_stay_visible_when_the_project_pins_another_profile() {
+        use roles::{Field, Role};
+        let (mut a, dir) = roles_app();
+        let id = a.project_id();
+        a.profiles.cycle_project_profile(&id, 1); // pin Budget (lead effort low)
+        a.apply_profiles();
+        a.roles_open = true;
+        a.roles_field = Field::Effort;
+        assert!(!a.roles_project_scope);
+        // The table shows the profile being edited, and the pinned one is what launches.
+        assert_eq!(a.roles_view().display(Role::Lead, Field::Effort), "default");
+        assert_eq!(a.role_settings.lead.effort, "low");
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        assert_eq!(a.roles_view().display(Role::Lead, Field::Effort), "low");
+        assert_eq!(a.profiles.active_settings().lead.effort, "low");
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        assert_eq!(a.roles_view().display(Role::Lead, Field::Effort), "medium");
+        // What launches is still the project's pin.
+        assert_eq!(a.role_settings.lead.effort, "low");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn changing_the_project_re_resolves_the_settings_on_setup_only() {
+        let (mut a, dir) = roles_app();
+        let other = dir.join("other");
+        fs::create_dir_all(&other).unwrap();
+        let id = profiles::project_key(&other);
+        a.profiles.cycle_project_profile(&id, 1); // Budget
+        a.sync_roles();
+        assert_eq!(a.role_settings, roles::Settings::default());
+        a.project = other.display().to_string();
+        a.sync_roles();
+        assert_eq!(a.role_settings.lead.effort, "low");
+        // A running session keeps what it launched with.
+        a.page = Page::Running;
+        a.project = std::env::current_dir().unwrap().display().to_string();
+        a.sync_roles();
+        assert_eq!(a.role_settings.lead.effort, "low");
         let _ = fs::remove_dir_all(dir);
     }
 

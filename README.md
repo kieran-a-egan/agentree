@@ -101,19 +101,56 @@ A panel whose content overflows shows its position in the title, for example `â†
 
 You can also preview the interface without starting Claude using `agentree --demo`.
 
-## Role models
+## Role models and profiles
 
-Press **F4** on the setup screen to open the Roles overlay. It sets the model, effort, concurrency and permission mode for each role: Lead, Planner, Explorer, Researcher, Coder, Tester, Advisor and Final reviewer. Changes are saved at once to `roles.json` in `%LOCALAPPDATA%\ClaudeAgentTree`.
+Press **F4** on the setup screen to open the Roles overlay. It sets the model, effort, concurrency and permission mode for each role: Lead, Planner, Explorer, Researcher, Coder, Tester, Advisor and Final reviewer. Changes are saved at once to `profiles.json` in `%LOCALAPPDATA%\ClaudeAgentTree`, so they survive a restart.
 
-The defaults use the same launch flags and environment as before: Haiku for the lead and teammates, and Opus for the advisor and final review. The one behaviour change is in the lead's instructions: each teammate role is now limited to three running at once, which previously had no limit.
+### Profiles
+
+Settings are kept in named profiles. Four are built in:
+
+| Profile | What it is |
+| --- | --- |
+| **Balanced** | The default, and the launch Agentree has always used: Haiku lead and teammates, up to three of each teammate role, Opus advisor and final review. |
+| **Budget** | Haiku throughout, lead effort low, one teammate per role. |
+| **Local** | Reserved for local models, which arrive in v0.7. Until then it is Haiku only with no advisor, so Opus is never called and a final review can only end BLOCKED. |
+| **Thorough** | Sonnet for the lead, Planner, Coder and Tester, lead effort high. |
+
+You can edit any profile; **d** restores a role to its built-in values (Balanced's, for a profile that is not built in).
+
+### Per-project choices
+
+A project can pin a different profile and override single fields over it. The settings a run uses are resolved in this order, later steps winning:
+
+1. the active (global) profile,
+2. the profile pinned for the project, if any,
+3. the project's field overrides.
+
+Project choices are saved in `profiles.json` under the project's folder, not in the repository, so a cloned repository cannot change models or permission modes. In the overlay, a `*` after a role marks it as overridden for the current project.
 
 | Key | Action |
 | --- | --- |
 | **Up** / **Down** | Choose a role |
 | **Left** / **Right** | Change the selected value |
 | **Tab** | Move to the next field |
-| **d** | Reset the selected role to its defaults |
+| **p** / **P** | Next / previous profile (the global one, or this project's pin in project scope; project scope also offers "follow global") |
+| **s** | Switch between editing the profile and this project's overrides |
+| **d** | Reset the selected role: to its built-in values, or in project scope clear its overrides |
 | **Esc** or **F4** | Close the overlay |
+
+### Upgrading from `roles.json`
+
+The first time a version with profiles starts and finds a `roles.json`, its settings become the **Migrated** profile and it is made active, so a run is configured exactly as before. Unsupported values are replaced with defaults and listed in the overlay. `roles.json` is left in place and never written again. A `profiles.json` that cannot be read or comes from a newer Agentree is moved to `profiles.json.invalid` and the built-in profiles are used, so nothing you wrote is overwritten.
+
+### Credentials
+
+Profiles may carry credential **references**, never values: `env:NAME` for an environment variable or `wincred:TARGET` for a Windows Credential Manager entry. Anything else, including a pasted API key, is rejected, removed on load and not shown in messages. Claude Code uses its own sign-in, so nothing reads these references in this version; they are the contract for backends that need credentials in v0.7. Edit `profiles.json` to add them:
+
+```json
+"credentials": { "anthropic": "env:ANTHROPIC_API_KEY" }
+```
+
+### How settings reach Claude
 
 Each setting is labelled by how it reaches Claude:
 
@@ -122,7 +159,7 @@ Each setting is labelled by how it reaches Claude:
 
 With the advisor set to **off**, Opus is not consulted, so a final review can only end BLOCKED.
 
-Not in this version: profiles, per-project settings, and the `bypassPermissions`, `auto`, `dontAsk` and `manual` permission modes. Claude Code is the only backend. Pi and local models are planned for v0.7.
+Not in this version: custom profile creation from the overlay (add one by editing `profiles.json`), and the `bypassPermissions`, `auto`, `dontAsk` and `manual` permission modes. Claude Code is the only backend. Pi and local models are planned for v0.7.
 
 ## Use a GitHub issue
 

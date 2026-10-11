@@ -1,5 +1,6 @@
 use crate::capability::Status;
 use crate::model::EventKind;
+use crate::profiles;
 use crate::roles::{self, Field, Role, FIELDS, ROLES};
 use crate::scroll::Pane;
 use crate::{App, Attention, Focus, Page};
@@ -294,6 +295,10 @@ fn setup(frame: &mut Frame, body: Rect, app: &App) {
     );
     let mut history = vec![];
     let notes = app.role_settings.notes().len();
+    history.push(accent(
+        format!("Profile: {}", app.profiles.profile_name(&app.settings_key)),
+        CYAN,
+    ));
     if notes > 0 {
         history.push(accent(format!("{notes} role notes: F4 explains"), ORANGE));
     }
@@ -1416,7 +1421,10 @@ fn capabilities(frame: &mut Frame, area: Rect, app: &App) {
 /// last and the notes take whatever height is left.
 fn roles(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
-    let outer = block("ROLES — model settings (saved on every change)", CYAN);
+    let outer = block(
+        "ROLES — profiles and model settings (saved on every change)",
+        CYAN,
+    );
     let inner = outer.inner(area);
     frame.render_widget(outer, area);
     let parts = divide(
@@ -1430,26 +1438,57 @@ fn roles(frame: &mut Frame, area: Rect, app: &App) {
         ],
         false,
     );
+    let project = app.settings_key.as_str();
+    let name = app.profiles.profile_name(project);
+    let pinned = if app.profiles.pinned(project) {
+        " (pinned by this project)"
+    } else {
+        ""
+    };
+    let editing = if app.roles_project_scope {
+        "overrides for this project (* marks an overridden role)".to_owned()
+    } else if app.profiles.pinned(project) {
+        format!(
+            "global profile {} (not used here: this project pins {name})",
+            app.profiles.active
+        )
+    } else {
+        format!("global profile {}", app.profiles.active)
+    };
+    let width = parts[0].width as usize;
     frame.render_widget(
-        Paragraph::new(Line::raw(
-            "Backend: Claude Code (the only backend this version supports; Pi and local models arrive in v0.7).",
-        ))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(vec![
+            accent(
+                shorten(
+                    &format!(
+                        "Launches with: {name}{pinned} - {}",
+                        profiles::describe(name)
+                    ),
+                    width,
+                ),
+                CYAN,
+            ),
+            Line::raw(shorten(&format!("Editing: {editing}"), width)),
+        ]),
         parts[0],
     );
-
+    let view = app.roles_view();
     let selected_column = FIELDS
         .iter()
         .position(|f| *f == app.roles_field)
         .unwrap_or(0)
         + 2;
     let rows = ROLES.iter().enumerate().map(|(row, &role)| {
-        let mut cells = vec![role.label().to_owned(), "Claude Code".to_owned()];
-        cells.extend(
-            FIELDS
-                .iter()
-                .map(|&field| app.role_settings.display(role, field)),
-        );
+        let marker = if app.roles_project_scope && app.profiles.has_overrides(project, role) {
+            "*"
+        } else {
+            ""
+        };
+        let mut cells = vec![
+            format!("{}{marker}", role.label()),
+            "Claude Code".to_owned(),
+        ];
+        cells.extend(FIELDS.iter().map(|&field| view.display(role, field)));
         cells.push(roles::applies(role, Field::Model).to_owned());
         Row::new(cells.into_iter().enumerate().map(|(column, text)| {
             let selected = row == app.roles_row && column == selected_column;
@@ -1512,11 +1551,16 @@ fn roles(frame: &mut Frame, area: Rect, app: &App) {
         parts[3],
     );
     frame.render_widget(
-        Paragraph::new(accent(
-            "Up/Down role · Left/Right change value · Tab next field · d reset role · Esc or F4 close"
-                .into(),
-            CYAN,
-        ))
+        Paragraph::new(vec![
+            accent(
+                "Up/Down role · Left/Right value · Tab field · d reset role".into(),
+                CYAN,
+            ),
+            accent(
+                "p/P profile · s profile or project · Esc or F4 close".into(),
+                CYAN,
+            ),
+        ])
         .wrap(Wrap { trim: false }),
         parts[4],
     );
