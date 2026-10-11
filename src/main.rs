@@ -1768,6 +1768,46 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// v0.5 release gate, UI half: the model is changed in the overlay, survives a restart and is
+    /// the plan that launches; a plan the CLI cannot run is refused with nothing spawned.
+    #[test]
+    fn release_gate_overlay_model_change_survives_restart_and_is_checked_before_launch() {
+        use capability::{Discovery, Row, Status};
+        let (mut a, dir) = roles_app();
+        let default_lead = roles::Settings::default().lead.model;
+        a.handle(key(KeyCode::F(4), KeyModifiers::NONE), AREA);
+        assert_eq!(a.roles_row, 0);
+        assert_eq!(a.roles_field, roles::Field::Model);
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        let chosen = a.role_settings.lead.model.clone();
+        assert_ne!(chosen, default_lead);
+
+        // Restart: a fresh load of the saved file launches the same plan.
+        let (back, notices) = profiles::load(&a.profiles_file, &dir.join("roles.json"));
+        assert!(notices.is_empty(), "{notices:?}");
+        assert_eq!(
+            back.effective(&a.project_id()).plan(),
+            a.role_settings.plan()
+        );
+        assert_eq!(a.role_settings.plan().lead_model, chosen);
+
+        // The installed CLI rejecting --model blocks the launch before any session exists.
+        let no_model = Discovery {
+            cli: Some("claude.exe".into()),
+            rows: vec![Row {
+                capability: "--model".into(),
+                flag: Some("--model"),
+                status: Status::Unsupported,
+                note: String::new(),
+            }],
+        };
+        let err = a.check_launch(no_model).unwrap_err().to_string();
+        assert!(err.contains("--model"), "{err}");
+        assert!(a.capabilities_open);
+        assert!(a.session.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn roles_overlay_explains_a_field_that_does_not_apply() {
         let (mut a, dir) = roles_app();
