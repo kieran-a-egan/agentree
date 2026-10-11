@@ -111,6 +111,15 @@ fn claude_launch_args(
         args.push("--teammate-mode".into());
         args.push("in-process".into());
     }
+    // Unset values are omitted so Claude Code keeps its own defaults.
+    if let Some(effort) = &plan.effort {
+        args.push("--effort".into());
+        args.push(effort.as_str().into());
+    }
+    if let Some(mode) = &plan.permission_mode {
+        args.push("--permission-mode".into());
+        args.push(mode.as_str().into());
+    }
     args.push("--session-id".into());
     args.push(session_id.into());
     args.push("--append-system-prompt-file".into());
@@ -320,6 +329,33 @@ mod tests {
             real_cli_argv(direct).unwrap(),
             (direct.to_path_buf(), Vec::new())
         );
+    }
+
+    #[test]
+    fn lead_effort_and_permission_mode_become_flags_only_when_set() {
+        let policy = Path::new("policy.txt");
+        let plan = RolePlan {
+            effort: Some("xhigh".into()),
+            permission_mode: Some("plan".into()),
+            ..RolePlan::claude_default()
+        };
+        let values: Vec<String> = claude_launch_args(&plan, "run", policy, "go")
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        let at = values.iter().position(|v| v == "--effort").unwrap();
+        assert_eq!(
+            &values[at..at + 4],
+            ["--effort", "xhigh", "--permission-mode", "plan"]
+        );
+        let default: Vec<String> =
+            claude_launch_args(&RolePlan::claude_default(), "run", policy, "go")
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+        assert!(!default
+            .iter()
+            .any(|a| a == "--effort" || a == "--permission-mode"));
     }
 
     #[test]

@@ -50,6 +50,7 @@ Before merging a change to the launcher or terminal UI, additionally smoke-test 
 | `src/scroll.rs` | Shared scroll model: pane identity, offsets, key and wheel mapping |
 | `src/pty.rs` | Native Claude subprocess and ConPTY integration |
 | `src/capability.rs` | Claude Code capability matrix, launch-plan preflight and the flag probes behind them |
+| `src/roles.rs` | Per-role model settings: the Roles overlay options, validation, launch notes and the launch plan they produce |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
@@ -79,6 +80,26 @@ Claude itself coordinates teammates and handles permissions. Agentree does **not
 Token and activity data come from local Claude session transcripts. The parser deduplicates repeated message usage where possible. Runtime reflects observation and objective lifecycle, not billed model-processing time. Estimated cost is based on API list prices; it is not an invoice or a calculation of Claude subscription usage. Context utilisation is approximate.
 
 Opus advice and final-review requests are model-directed, not externally enforced gates. The review panel distinguishes a reported review result from evidence that Opus was actually consulted. Claude's terminal remains the authoritative place for permission prompts and human decisions.
+
+### Role settings
+
+`src/roles.rs` owns the per-role settings: the `Settings` that the Roles overlay edits and `roles.json` stores, the values each field can take, validation on load, the launch notes, and `Settings::plan()`, which builds the `RolePlan`. `capability.rs` owns `RolePlan` and `preflight`. The overlay, the file and the launch all read from `roles.rs`, so a saved choice is the one that launches.
+
+`roles::options(role, field)` is the single source of truth for the values a field can take. The overlay cycles through it, `Settings::sanitized` replaces any stored value outside it with the default, and `roles::applies` uses it to decide whether a field applies to a role. An empty slice means the field does not apply.
+
+Settings reach Claude in two ways, and `roles::applies` labels each one:
+
+- **Enforced** by a launch flag: the lead model (`--model`), lead effort (`--effort`), lead permission mode (`--permission-mode`), and the advisor (`--advisor`, omitted when off). Unnamed subagents use the Coder model through `CLAUDE_CODE_SUBAGENT_MODEL`.
+- **Instruction to lead** only: teammate models, concurrency limits and permission modes. `Settings::notes` says Agentree cannot confirm them. Do not describe them as enforced.
+
+Preflight checks the effort and permission values against the same lists in `roles.rs`, and blocks only when the plan sets a flag the CLI rejects. The final reviewer is labelled "via the Opus advisor" because it runs through the advisor.
+
+To add an option:
+
+1. Add the value to the matching list in `roles.rs` (`MODELS`, `EFFORTS`, `PERMISSIONS`, `CONCURRENCY` or `ADVISOR_MODELS`), or change `options` if only some roles get it. Add a `model_label` entry for a new model.
+2. If the value is a launch flag that is new to Agentree, add the flag to `PROBED` in `capability.rs` and to the `needed` list in `preflight` for the plan rule that uses it.
+3. If the value is an instruction, carry it in `Settings::plan()` (the `Teammate` entries), render it in `system_policy` in `prompt.rs` under "Role assignments", and mention it in `notes`.
+4. Extend the `roles.rs` tests, and the `capability.rs` tests when a flag is involved.
 
 ## Terminal stack
 

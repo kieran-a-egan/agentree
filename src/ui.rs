@@ -1,12 +1,13 @@
 use crate::capability::Status;
 use crate::model::EventKind;
+use crate::roles::{self, Field, Role, FIELDS, ROLES};
 use crate::scroll::Pane;
 use crate::{App, Attention, Focus, Page};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
     Frame,
 };
 
@@ -151,13 +152,18 @@ fn small_frame(frame: &mut Frame, msg: &str) {
         frame.area(),
     );
 }
-fn header(frame: &mut Frame, area: Rect, page: Page, demo: bool) {
-    let mode = if demo {
+fn header(frame: &mut Frame, area: Rect, app: &App) {
+    let mode = if app.demo {
         "DEMO - OFFLINE"
-    } else if page == Page::Running {
+    } else if app.page == Page::Running {
         "LIVE NATIVE TEAM"
     } else {
         "WINDOWS / CONPTY"
+    };
+    let advisor = if app.role_settings.advisor.model == "off" {
+        "NO ADVISOR  "
+    } else {
+        "OPUS ON CALL  "
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -167,11 +173,15 @@ fn header(frame: &mut Frame, area: Rect, page: Page, demo: bool) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("HAIKU 5.5 TEAM  ", Style::default().fg(CYAN)),
-            Span::styled("OPUS ON CALL  ", Style::default().fg(OPUS)),
+            Span::styled("NATIVE TEAM  ", Style::default().fg(CYAN)),
+            Span::styled(advisor, Style::default().fg(OPUS)),
             Span::styled(
                 mode,
-                Style::default().fg(if demo { Color::Yellow } else { Color::Green }),
+                Style::default().fg(if app.demo {
+                    Color::Yellow
+                } else {
+                    Color::Green
+                }),
             ),
         ]))
         .alignment(ratatui::layout::Alignment::Center)
@@ -282,10 +292,15 @@ fn setup(frame: &mut Frame, body: Rect, app: &App) {
         },
         content,
     );
-    let mut history = vec![accent(
+    let mut history = vec![];
+    let notes = app.role_settings.notes().len();
+    if notes > 0 {
+        history.push(accent(format!("{notes} role notes: F4 explains"), ORANGE));
+    }
+    history.push(accent(
         "RECENT PROJECTS  (Up/Down on project field)".to_owned(),
         OPUS,
-    )];
+    ));
     history.extend(
         app.recent
             .iter()
@@ -669,12 +684,13 @@ fn review_finished(app: &App) -> bool {
 }
 fn lead_and_opus(frame: &mut Frame, lead_area: Rect, advisor_area: Rect, app: &App) {
     let lead = app.telemetry.actors.get("main");
+    let lead_model = roles::model_label(&app.role_settings.lead.model);
     let mut content = vec![
         accent(
             if active_agent(app, "main") {
-                "HAIKU 5.5 // RECENT OBSERVED ACTIVITY".into()
+                format!("{lead_model} // RECENT OBSERVED ACTIVITY")
             } else {
-                "HAIKU 5.5 // PLANS + COORDINATES".into()
+                format!("{lead_model} // PLANS + COORDINATES")
             },
             ORANGE,
         ),
@@ -693,7 +709,7 @@ fn lead_and_opus(frame: &mut Frame, lead_area: Rect, advisor_area: Rect, app: &A
         lead_area,
         app,
         Pane::Lead,
-        "HAIKU 5.5 / MAIN",
+        &format!("{lead_model} / MAIN"),
         ORANGE,
         content,
     );
@@ -871,7 +887,7 @@ fn worker_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
             area,
             app,
             worker_pane(idx),
-            "HAIKU / AVAILABLE",
+            "TEAMMATE / AVAILABLE",
             CYAN,
             vec![accent("Waiting for Claude teammate".into(), MUTED)],
         );
@@ -917,7 +933,17 @@ fn worker_card(frame: &mut Frame, area: Rect, app: &App, idx: usize) {
         area,
         app,
         worker_pane(idx),
-        &format!("HAIKU / {}", shorten(&worker.name, max.saturating_sub(10))),
+        &{
+            // Shown only when a transcript recorded it; the configured model is not evidence of what ran.
+            let model = match app.telemetry.actors.get(&worker.name) {
+                Some(t) if !t.model.is_empty() => t.model.clone(),
+                _ => "model unknown".into(),
+            };
+            format!(
+                "{model} / {}",
+                shorten(&worker.name, max.saturating_sub(model.len() + 3))
+            )
+        },
         CYAN,
         content,
     );
@@ -1265,7 +1291,8 @@ fn help_lines() -> Vec<Line<'static>> {
         section("SETUP"),
         Line::raw("  Tab switch project/objective    Ctrl+Up/Down scroll the objective"),
         Line::raw("  F2 folders   F3 GitHub issues   F5 start   Ctrl+L clear   Esc quit"),
-        Line::raw("  F7 check the Claude Code CLI: capabilities and launch plan"),
+        Line::raw("  F4 role models (Setup): open the Roles overlay"),
+        Line::raw("  F7 check the Claude Code CLI: capabilities and the saved launch plan"),
         section("GITHUB ISSUES"),
         Line::raw("  Up/Down PgUp/PgDn select; the list follows the selection"),
         Line::raw("  Tab moves Ctrl+scroll between the list and the preview"),
@@ -1307,8 +1334,9 @@ fn help(frame: &mut Frame, area: Rect, app: &App) {
         help_lines(),
     );
 }
-fn capabilities_rect(area: Rect) -> Rect {
-    let width = area.width.saturating_sub(4).min(92);
+/// A centred overlay. The Roles table needs more columns than the F7 list, so it passes a wider cap.
+fn modal_rect(area: Rect, max_width: u16) -> Rect {
+    let width = area.width.saturating_sub(4).min(max_width);
     let height = area.height.saturating_sub(2).clamp(4, 30);
     Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -1330,7 +1358,7 @@ fn capabilities_lines(app: &App) -> Vec<Line<'static>> {
     let mut out = vec![section("LAUNCH PLAN")];
     if app.launch_problems.is_empty() {
         out.push(accent(
-            "Ready: default Claude plan passes preflight.".into(),
+            "Ready: the saved role plan passes preflight.".into(),
             Color::Green,
         ));
     } else {
@@ -1384,6 +1412,115 @@ fn capabilities(frame: &mut Frame, area: Rect, app: &App) {
         capabilities_lines(app),
     );
 }
+/// The Roles overlay. Lines that do not fit at the edge are clipped, so the footer keys sit
+/// last and the notes take whatever height is left.
+fn roles(frame: &mut Frame, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let outer = block("ROLES — model settings (saved on every change)", CYAN);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let parts = divide(
+        inner,
+        &[
+            Constraint::Length(2),
+            Constraint::Length(ROLES.len() as u16 + 1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ],
+        false,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::raw(
+            "Backend: Claude Code (the only backend this version supports; Pi and local models arrive in v0.7).",
+        ))
+        .wrap(Wrap { trim: false }),
+        parts[0],
+    );
+
+    let selected_column = FIELDS
+        .iter()
+        .position(|f| *f == app.roles_field)
+        .unwrap_or(0)
+        + 2;
+    let rows = ROLES.iter().enumerate().map(|(row, &role)| {
+        let mut cells = vec![role.label().to_owned(), "Claude Code".to_owned()];
+        cells.extend(
+            FIELDS
+                .iter()
+                .map(|&field| app.role_settings.display(role, field)),
+        );
+        cells.push(roles::applies(role, Field::Model).to_owned());
+        Row::new(cells.into_iter().enumerate().map(|(column, text)| {
+            let selected = row == app.roles_row && column == selected_column;
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(CYAN)
+            } else {
+                Style::default()
+            };
+            Cell::from(text).style(style)
+        }))
+    });
+    let widths = [
+        Constraint::Length(14),
+        Constraint::Length(11),
+        Constraint::Length(17),
+        Constraint::Length(7),
+        Constraint::Length(11),
+        Constraint::Length(11),
+        Constraint::Min(0),
+    ];
+    let header = Row::new([
+        "Role",
+        "Backend",
+        "Model",
+        "Effort",
+        "Concurrency",
+        "Permission",
+        "How it applies",
+    ])
+    .style(Style::default().fg(ORANGE).add_modifier(Modifier::BOLD));
+    frame.render_widget(Table::new(rows, widths).header(header), parts[1]);
+
+    let mut notes = vec![accent("Before launch".into(), ORANGE)];
+    notes.extend(app.role_settings.notes().into_iter().map(Line::raw));
+    notes.extend(
+        app.role_notices
+            .iter()
+            .map(|n| Line::styled(n.clone(), Style::default().fg(Color::Yellow))),
+    );
+    frame.render_widget(Paragraph::new(notes).wrap(Wrap { trim: false }), parts[2]);
+
+    let role = ROLES.get(app.roles_row).copied().unwrap_or(Role::Lead);
+    let explain = if roles::options(role, app.roles_field).is_empty() {
+        format!(
+            "{} {} does not apply. {}",
+            role.label(),
+            app.roles_field.label(),
+            roles::not_applicable_reason(role, app.roles_field)
+        )
+    } else {
+        format!(
+            "{} {}: {}.",
+            role.label(),
+            app.roles_field.label(),
+            roles::applies(role, app.roles_field)
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(accent(shorten(&explain, parts[3].width as usize), CYAN)),
+        parts[3],
+    );
+    frame.render_widget(
+        Paragraph::new(accent(
+            "Up/Down role · Left/Right change value · Tab next field · d reset role · Esc or F4 close"
+                .into(),
+            CYAN,
+        ))
+        .wrap(Wrap { trim: false }),
+        parts[4],
+    );
+}
 
 /// Every pane on the current page, with its rectangle. Mouse hit-testing reads this, and
 /// `draw` lays out from the same helpers, so they agree on what is on screen.
@@ -1421,7 +1558,7 @@ pub fn regions(area: Rect, app: &App) -> Vec<(Pane, Rect)> {
         out.push((Pane::Help, help_rect(area)));
     }
     if app.capabilities_open {
-        out.push((Pane::Capabilities, capabilities_rect(area)));
+        out.push((Pane::Capabilities, modal_rect(area, 92)));
     }
     out
 }
@@ -1451,7 +1588,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     }
     let shell = shell(area);
-    header(frame, shell[0], app.page, app.demo);
+    header(frame, shell[0], app);
     match app.page {
         Page::Setup => setup(frame, shell[1], app),
         Page::Browser => browser(frame, shell[1], app),
@@ -1463,7 +1600,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
         help(frame, help_rect(area), app);
     }
     if app.capabilities_open {
-        capabilities(frame, capabilities_rect(area), app);
+        capabilities(frame, modal_rect(area, 92), app);
+    }
+    if app.roles_open {
+        roles(frame, modal_rect(area, 100), app);
     }
 }
 
@@ -1627,6 +1767,27 @@ mod capability_overlay_tests {
         let text = screen(78, 21, &app);
         assert!(!text.contains("CAPABILITIES"), "{text}");
         assert!(text.contains("F7 CLI check"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod roles_overlay_tests {
+    use super::issue_page_tests::screen;
+    use super::*;
+
+    #[test]
+    fn roles_overlay_lists_every_role_and_names_the_close_key_at_minimum_size() {
+        let mut app = App::new(crate::Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        app.roles_open = true;
+        let text = screen(80, 24, &app);
+        assert!(text.contains("Final reviewer"), "{text}");
+        assert!(text.contains("Claude Code"), "{text}");
+        assert!(text.contains("Esc or F4 close"), "{text}");
     }
 }
 

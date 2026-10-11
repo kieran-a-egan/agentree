@@ -46,7 +46,7 @@ The normal `claude` command is unchanged.
 | **F7** | Respond to a reported blocker (running); show the Claude Code capability matrix (setup screen) |
 | **F8** | Toggle full Claude terminal |
 | **F9** | Toggle full dashboard |
-| **F4** | Pause/resume the displayed timer |
+| **F4** | Pause/resume the displayed timer (running); open the role model settings (setup screen) |
 | **Esc** | Quit (setup screen) |
 | **Ctrl+Q** twice | Quit and terminate the embedded session |
 
@@ -100,6 +100,29 @@ A panel whose content overflows shows its position in the title, for example `â†
 - Agentree captures the mouse while it runs, so click-drag text selection inside Agentree is disabled. To select text, use your terminal's bypass modifier (Windows Terminal: **Shift+drag**).
 
 You can also preview the interface without starting Claude using `agentree --demo`.
+
+## Role models
+
+Press **F4** on the setup screen to open the Roles overlay. It sets the model, effort, concurrency and permission mode for each role: Lead, Planner, Explorer, Researcher, Coder, Tester, Advisor and Final reviewer. Changes are saved at once to `roles.json` in `%LOCALAPPDATA%\ClaudeAgentTree`.
+
+The defaults use the same launch flags and environment as before: Haiku for the lead and teammates, and Opus for the advisor and final review. The one behaviour change is in the lead's instructions: each teammate role is now limited to three running at once, which previously had no limit.
+
+| Key | Action |
+| --- | --- |
+| **Up** / **Down** | Choose a role |
+| **Left** / **Right** | Change the selected value |
+| **Tab** | Move to the next field |
+| **d** | Reset the selected role to its defaults |
+| **Esc** or **F4** | Close the overlay |
+
+Each setting is labelled by how it reaches Claude:
+
+- **enforced** settings are passed to Claude Code as launch flags: the lead's model, effort and permission mode, and the advisor.
+- **instruction to lead** settings are written into the lead's prompt: teammate models, concurrency and permission modes. Claude Code does not apply these to each teammate, so Agentree cannot confirm them. Not verified in a live session.
+
+With the advisor set to **off**, Opus is not consulted, so a final review can only end BLOCKED.
+
+Not in this version: profiles, per-project settings, and the `bypassPermissions`, `auto`, `dontAsk` and `manual` permission modes. Claude Code is the only backend. Pi and local models are planned for v0.7.
 
 ## Use a GitHub issue
 
