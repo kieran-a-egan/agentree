@@ -1,3 +1,4 @@
+use crate::capability::RolePlan;
 use anyhow::{bail, Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::{
@@ -86,35 +87,46 @@ impl Drop for Session {
 
 // Exactly one native lead CLI is launched; teammates are created by Claude's
 // named Agent tool inside that interactive session, not by separate PTYs.
-const CLAUDE_TEAM_ENV: [(&str, &str); 2] = [
-    ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1"),
-    ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5"),
-];
+fn claude_team_env(plan: &RolePlan) -> Vec<(&'static str, String)> {
+    let mut env = Vec::new();
+    if plan.native_teams {
+        env.push(("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".to_string()));
+    }
+    env.push(("CLAUDE_CODE_SUBAGENT_MODEL", plan.subagent_model.clone()));
+    env
+}
 
-fn claude_launch_args(session_id: &str, policy: &Path, first_message: &str) -> Vec<OsString> {
-    vec![
-        "--model".into(),
-        "claude-haiku-5-5".into(),
-        "--advisor".into(),
-        "opus".into(),
-        "--teammate-mode".into(),
-        "in-process".into(),
-        "--session-id".into(),
-        session_id.into(),
-        "--append-system-prompt-file".into(),
-        policy.as_os_str().to_os_string(),
-        first_message.into(),
-    ]
+fn claude_launch_args(
+    plan: &RolePlan,
+    session_id: &str,
+    policy: &Path,
+    first_message: &str,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--model".into(), plan.lead_model.as_str().into()];
+    if let Some(advisor) = &plan.advisor {
+        args.push("--advisor".into());
+        args.push(advisor.as_str().into());
+    }
+    if plan.native_teams {
+        args.push("--teammate-mode".into());
+        args.push("in-process".into());
+    }
+    args.push("--session-id".into());
+    args.push(session_id.into());
+    args.push("--append-system-prompt-file".into());
+    args.push(policy.as_os_str().to_os_string());
+    args.push(first_message.into());
+    args
 }
 
 pub fn spawn(
     cli: &Path,
+    plan: &RolePlan,
     project: &Path,
     session_id: &str,
     policy: &Path,
     first_message: &str,
-    rows: u16,
-    cols: u16,
+    (rows, cols): (u16, u16),
 ) -> Result<Session> {
     if !cli.exists() {
         bail!(
@@ -140,8 +152,8 @@ pub fn spawn(
     .to_string();
     let mut cmd = CommandBuilder::new(exe.as_os_str());
     cmd.args(prefix);
-    cmd.args(claude_launch_args(session_id, policy, first_message));
-    for (name, value) in CLAUDE_TEAM_ENV {
+    cmd.args(claude_launch_args(plan, session_id, policy, first_message));
+    for (name, value) in claude_team_env(plan) {
         cmd.env(name, value);
     }
     cmd.cwd(project.as_os_str());
@@ -273,7 +285,8 @@ mod tests {
     fn native_launcher_preserves_objective_and_team_settings() {
         let policy = Path::new("C:/project with spaces/agentree-policy.txt");
         let objective = "Implement issue #5: & | > \"quoted\"; don't escape shell metacharacters";
-        let args = claude_launch_args("run-guid", policy, objective);
+        let plan = RolePlan::claude_default();
+        let args = claude_launch_args(&plan, "run-guid", policy, objective);
         let values: Vec<String> = args
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
@@ -295,10 +308,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            CLAUDE_TEAM_ENV,
+            claude_team_env(&plan),
             [
-                ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1"),
-                ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5"),
+                ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".to_string()),
+                ("CLAUDE_CODE_SUBAGENT_MODEL", "claude-haiku-5-5".to_string()),
             ]
         );
         // A direct executable path needs no shell or wrapper.

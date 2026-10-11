@@ -1,3 +1,4 @@
+mod capability;
 mod github;
 mod live;
 mod team;
@@ -185,6 +186,12 @@ pub struct App {
     /// The dashboard panel Ctrl+scroll moves while Focus::Dashboard is set (F5 cycles it).
     pub dash_focus: Pane,
     pub help_open: bool,
+    /// Capability matrix from the last probe of the installed CLI. `None` until F7 or a launch.
+    pub capabilities: Option<capability::Discovery>,
+    /// F7 on Setup, and opened automatically when a launch is blocked.
+    pub capabilities_open: bool,
+    /// Proven problems with the launch plan against `capabilities`. Empty means it may launch.
+    pub launch_problems: Vec<capability::Diagnostic>,
 }
 impl App {
     fn new(args: Args) -> Self {
@@ -253,7 +260,32 @@ impl App {
             issue_focus: Pane::Issues,
             dash_focus: Pane::Timeline,
             help_open: false,
+            capabilities: None,
+            capabilities_open: false,
+            launch_problems: Vec::new(),
         }
+    }
+    fn refresh_capabilities(&mut self, discovery: capability::Discovery) {
+        self.launch_problems =
+            capability::preflight(&capability::RolePlan::claude_default(), &discovery);
+        self.capabilities = Some(discovery);
+    }
+    /// Blocks the launch with the first problem and opens the matrix when the plan is invalid.
+    fn check_launch(&mut self, discovery: capability::Discovery) -> Result<()> {
+        self.refresh_capabilities(discovery);
+        let Some(first) = self.launch_problems.first() else {
+            return Ok(());
+        };
+        self.capabilities_open = true;
+        let extra = match self.launch_problems.len() - 1 {
+            0 => String::new(),
+            more => format!(" (+{more} more)"),
+        };
+        anyhow::bail!(
+            "Launch blocked: {} {}{extra} F7 shows the capability matrix.",
+            first.problem,
+            first.fix
+        )
     }
     fn browser_open(&mut self) {
         self.browser_dir = if path_input(&self.project).is_dir() {
@@ -435,6 +467,10 @@ impl App {
         } else {
             Some(pty::cli_path()?)
         };
+        // Validate the plan before anything is saved or spawned. Demo mode launches nothing.
+        if let Some(cli) = &cli {
+            self.check_launch(capability::discover(Some(cli)))?;
+        }
         self.project = project.display().to_string();
         let mut pref = read_prefs();
         pref.projects.retain(|x| x != &self.project);
@@ -467,12 +503,12 @@ impl App {
         if let Some(cli) = cli {
             self.session = Some(pty::spawn(
                 &cli,
+                &capability::RolePlan::claude_default(),
                 &project,
                 &self.session_id,
                 &policy_file,
                 &initial,
-                rows,
-                cols,
+                (rows, cols),
             )?);
             self.message = format!(
                 "Claude process launched. Waiting for terminal startup | {}",
@@ -502,6 +538,7 @@ impl App {
         self.live = Default::default();
         self.activity = Default::default();
         self.help_open = false;
+        self.capabilities_open = false;
         Ok(())
     }
     fn poll(&mut self, area: ratatui::layout::Rect) {
@@ -808,6 +845,15 @@ impl App {
             return false;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // The capability matrix is modal, like the controls panel: keys never reach Claude.
+        if self.capabilities_open {
+            if matches!(key.code, KeyCode::Esc | KeyCode::F(7)) {
+                self.capabilities_open = false;
+            } else if let Some(m) = scroll::key_move(key) {
+                self.scrolls.get(Pane::Capabilities).apply(m);
+            }
+            return false;
+        }
         // F1 opens the controls panel on every page. While it is open, keys never reach Claude.
         if key.code == KeyCode::F(1) {
             self.help_open = !self.help_open;
@@ -848,6 +894,11 @@ impl App {
                         if let Err(e) = self.start(area) {
                             self.message = e.to_string();
                         }
+                    }
+                    KeyCode::F(7) => {
+                        let discovery = capability::discover(pty::cli_path().ok().as_deref());
+                        self.refresh_capabilities(discovery);
+                        self.capabilities_open = true;
                     }
                     KeyCode::Tab => {
                         self.focus = if self.focus == Focus::Project {
@@ -1285,6 +1336,49 @@ mod tests {
         };
         let mut a = App::new(args);
         assert!(a.start(ratatui::layout::Rect::new(0, 0, 140, 40)).is_err());
+    }
+    #[test]
+    fn launch_is_blocked_by_an_invalid_plan_and_opens_the_matrix() {
+        use capability::{Discovery, Row, Status};
+        let row = |flag: &'static str, status| Row {
+            capability: flag.into(),
+            flag: Some(flag),
+            status,
+            note: String::new(),
+        };
+        let old_cli = Discovery {
+            cli: Some("claude.exe".into()),
+            rows: vec![
+                row("--model", Status::Supported),
+                row("--advisor", Status::Unsupported),
+            ],
+        };
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: Some("Do the thing".into()),
+            demo: true,
+        });
+        let err = a.check_launch(old_cli).unwrap_err().to_string();
+        assert!(err.starts_with("Launch blocked:"), "{err}");
+        assert!(
+            err.contains("--advisor") && err.contains("claude update"),
+            "{err}"
+        );
+        assert!(a.capabilities_open);
+        assert_eq!(a.launch_problems.len(), 1);
+
+        let ok = Discovery {
+            cli: Some("claude.exe".into()),
+            rows: vec![
+                row("--model", Status::Supported),
+                row("--advisor", Status::Supported),
+            ],
+        };
+        a.capabilities_open = false;
+        assert!(a.check_launch(ok).is_ok());
+        assert!(a.launch_problems.is_empty());
+        assert!(!a.capabilities_open);
     }
     fn lookup_app(project: &str) -> App {
         let mut a = App::new(Args {

@@ -49,6 +49,7 @@ Before merging a change to the launcher or terminal UI, additionally smoke-test 
 | `src/ui.rs` | Terminal layout, panes, mouse hit-testing regions and activity highlights |
 | `src/scroll.rs` | Shared scroll model: pane identity, offsets, key and wheel mapping |
 | `src/pty.rs` | Native Claude subprocess and ConPTY integration |
+| `src/capability.rs` | Claude Code capability matrix, launch-plan preflight and the flag probes behind them |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
@@ -57,6 +58,21 @@ Before merging a change to the launcher or terminal UI, additionally smoke-test 
 | `src/github.rs` | GitHub remote discovery, read-only `gh` issue loading, and issue-to-objective generation |
 
 The versioned event contract, including how unknown usage is represented, is documented in `docs/EVENT_SCHEMA.md`. Claude-specific parsing belongs in the adapters (`telemetry.rs`, `team.rs`); new dashboard code should consume `model` types rather than Claude file formats.
+
+### Capability discovery and launch preflight
+
+`src/capability.rs` owns what Agentree asks Claude Code to run. A `RolePlan` (lead model, subagent model, advisor, native teams) produces the launch flags and environment in `pty.rs`, and the same plan is checked by `preflight` before anything is saved or spawned. A plan that passes preflight is the plan that launches.
+
+Discovery runs each probed flag once with no value (`claude --advisor`). A CLI that knows the flag fails with `argument missing`; one that does not fails with `unknown option`. Neither starts a session, and the probes run in parallel (about 0.15 s). Anything else is `Unverified`.
+
+- **Blocks launch:** a proven `Unsupported` flag that the plan needs (`--model`, `--session-id`, `--append-system-prompt-file`, plus `--advisor` when an advisor is set and `--teammate-mode` when native teams are on), or a model name outside the known list (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`) or an advisor other than `opus`.
+- **Never blocks:** `Unverified` results. Environment variables such as `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` and account model access can only be confirmed in a live session, so they are listed as unverified rather than refused.
+
+To check the rules against the Claude Code installed on your machine, run `cargo test -- --ignored --nocapture installed_cli`. The test prints the matrix and fails if the default plan is blocked. It is ignored in CI because the runner has no Claude CLI.
+
+The matrix is shown with **F7** on the setup screen and opens automatically when a launch is blocked. Each probe is re-run on every check, so updating Claude Code and pressing F5 again takes effect without restarting Agentree. To add a probed flag, add it to `PROBED` and to the plan rule that needs it, then extend `preflight`'s tests.
+
+The `--advisor` value is the alias `opus`, not a full model name. Keep the alias in `RolePlan` and in `ADVISORS`.
 
 Claude itself coordinates teammates and handles permissions. Agentree does **not** directly implement task scheduling or a JEV/System One reasoning router. Native team status comes from Claude's local team/task files. Background subagents are not presented as confirmed native teammates.
 

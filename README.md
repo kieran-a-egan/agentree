@@ -43,7 +43,7 @@ The normal `claude` command is unchanged.
 | **Ctrl+L** | Clear the objective (setup screen) |
 | **F5** | Start the objective (setup screen); cycle dashboard panels (running) |
 | **F6** | Focus Claude / return to split view |
-| **F7** | Respond to a reported blocker |
+| **F7** | Respond to a reported blocker (running); show the Claude Code capability matrix (setup screen) |
 | **F8** | Toggle full Claude terminal |
 | **F9** | Toggle full dashboard |
 | **F4** | Pause/resume the displayed timer |
