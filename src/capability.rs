@@ -6,7 +6,7 @@
 //! CLI to parse it with no value. Everything else is `Unverified`, and `Unverified` never
 //! blocks a launch. Only a proven `Unsupported` flag or an invalid model name does.
 
-use crate::pty;
+use crate::{pty, roles};
 use std::{
     ffi::OsString,
     path::Path,
@@ -18,10 +18,6 @@ use std::{
 /// A probe still running after this long is killed and treated as inconclusive.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub const HAIKU: &str = "claude-haiku-5-5";
-pub const SONNET: &str = "claude-sonnet-5-5";
-/// Models Agentree will hand to Claude Code as the lead or as a subagent.
-const MODELS: [&str; 3] = [HAIKU, SONNET, "claude-opus-5-5"];
 /// Values accepted by `--advisor`. The CLI takes a model alias here, not a full model name.
 const ADVISORS: [&str; 1] = ["opus"];
 
@@ -83,20 +79,31 @@ pub struct Diagnostic {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RolePlan {
     pub lead_model: String,
+    /// The model for unnamed subagents, via CLAUDE_CODE_SUBAGENT_MODEL.
     pub subagent_model: String,
     pub advisor: Option<String>,
     pub native_teams: bool,
+    /// `--effort` for the lead session. `None` leaves Claude Code's default.
+    pub effort: Option<String>,
+    /// `--permission-mode` for the lead session. `None` leaves Claude Code's default.
+    pub permission_mode: Option<String>,
+    /// Named teammates. Their settings reach Claude as instructions, not flags.
+    pub teammates: Vec<Teammate>,
+}
+
+/// One named-teammate role and the limits Claude is asked to follow for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Teammate {
+    pub role: &'static str,
+    pub model: String,
+    pub max_concurrent: u8,
+    pub permission: Option<String>,
 }
 
 impl RolePlan {
     /// The configuration Agentree has always launched: Haiku lead and workers, Opus advisor, native teams.
     pub fn claude_default() -> Self {
-        Self {
-            lead_model: HAIKU.into(),
-            subagent_model: HAIKU.into(),
-            advisor: Some("opus".into()),
-            native_teams: true,
-        }
+        roles::Settings::default().plan()
     }
 }
 
@@ -251,15 +258,29 @@ pub fn preflight(plan: &RolePlan, discovery: &Discovery) -> Vec<Diagnostic> {
             .unwrap_or(Status::Unverified)
     };
 
-    for (name, model) in [
-        ("Lead model", &plan.lead_model),
-        ("Subagent model", &plan.subagent_model),
-    ] {
-        if !MODELS.contains(&model.as_str()) {
+    let mut models = vec![
+        ("Lead model", plan.lead_model.as_str()),
+        ("Subagent model", plan.subagent_model.as_str()),
+    ];
+    for teammate in &plan.teammates {
+        models.push((teammate.role, teammate.model.as_str()));
+        if !(1..=4).contains(&teammate.max_concurrent) {
+            out.push(Diagnostic {
+                capability: format!("{} concurrency", teammate.role),
+                problem: format!(
+                    "{} teammates cannot run {} at once.",
+                    teammate.role, teammate.max_concurrent
+                ),
+                fix: "Choose a limit from 1 to 4.".into(),
+            });
+        }
+    }
+    for (name, model) in models {
+        if !roles::MODELS.contains(&model) {
             out.push(Diagnostic {
                 capability: name.into(),
                 problem: format!("'{model}' is not a model Agentree can run on Claude Code."),
-                fix: format!("Use one of: {}.", MODELS.join(", ")),
+                fix: format!("Use one of: {}.", roles::MODELS.join(", ")),
             });
         }
     }
@@ -275,9 +296,27 @@ pub fn preflight(plan: &RolePlan, discovery: &Discovery) -> Vec<Diagnostic> {
             });
         }
     }
+    if let Some(effort) = &plan.effort {
+        if !roles::EFFORTS[1..].contains(&effort.as_str()) {
+            out.push(Diagnostic {
+                capability: "Effort level".into(),
+                problem: format!("'{effort}' is not an effort level Claude Code accepts."),
+                fix: format!("Use one of: {}.", roles::EFFORTS[1..].join(", ")),
+            });
+        }
+    }
+    if let Some(mode) = &plan.permission_mode {
+        if !roles::PERMISSIONS[1..].contains(&mode.as_str()) {
+            out.push(Diagnostic {
+                capability: "Permission mode".into(),
+                problem: format!("'{mode}' is not a permission mode Agentree offers."),
+                fix: format!("Use one of: {}.", roles::PERMISSIONS[1..].join(", ")),
+            });
+        }
+    }
 
-    // Every launch passes these flags, so the CLI must accept them. The advisor and team
-    // flags are checked only when the plan asks for them.
+    // Every launch passes these flags, so the CLI must accept them. The advisor, team, effort
+    // and permission flags are checked only when the plan asks for them.
     let mut needed = vec![
         ("--model", "the lead model"),
         ("--session-id", "the run id"),
@@ -288,6 +327,12 @@ pub fn preflight(plan: &RolePlan, discovery: &Discovery) -> Vec<Diagnostic> {
     }
     if plan.native_teams {
         needed.push(("--teammate-mode", "native teammates"));
+    }
+    if plan.effort.is_some() {
+        needed.push(("--effort", "the lead effort level"));
+    }
+    if plan.permission_mode.is_some() {
+        needed.push(("--permission-mode", "the lead permission mode"));
     }
     for (flag, purpose) in needed {
         if status(flag) == Status::Unsupported {
@@ -306,6 +351,8 @@ pub fn preflight(plan: &RolePlan, discovery: &Discovery) -> Vec<Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const HAIKU: &str = roles::MODELS[0];
+    const SONNET: &str = roles::MODELS[1];
 
     /// A matrix in which every probed flag has the given status.
     fn matrix(status: Status) -> Discovery {
@@ -395,7 +442,7 @@ mod tests {
             lead_model: "gpt-4o".into(),
             subagent_model: HAIKU.into(),
             advisor: Some(SONNET.into()),
-            native_teams: true,
+            ..RolePlan::claude_default()
         };
         let d = preflight(&plan, &matrix(Status::Supported));
         assert_eq!(d.len(), 2);
@@ -403,6 +450,44 @@ mod tests {
         assert!(d[0].fix.contains(HAIKU));
         assert_eq!(d[1].capability, "Advisor");
         assert!(d[1].problem.contains(SONNET));
+    }
+
+    #[test]
+    fn invalid_effort_permission_and_teammate_limits_are_blocked() {
+        let mut plan = RolePlan {
+            effort: Some("ultra".into()),
+            permission_mode: Some("bypassPermissions".into()),
+            ..RolePlan::claude_default()
+        };
+        plan.teammates[0].max_concurrent = 9;
+        plan.teammates[1].model = "gpt-4o".into();
+        let d = preflight(&plan, &matrix(Status::Supported));
+        let capabilities: Vec<&str> = d.iter().map(|x| x.capability.as_str()).collect();
+        assert_eq!(
+            capabilities,
+            [
+                "Planner concurrency",
+                "Explorer",
+                "Effort level",
+                "Permission mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn effort_and_permission_flags_block_only_when_the_plan_sets_them() {
+        let set = RolePlan {
+            effort: Some("high".into()),
+            permission_mode: Some("plan".into()),
+            ..RolePlan::claude_default()
+        };
+        assert!(preflight(&set, &matrix(Status::Supported)).is_empty());
+        let old = with_unsupported("--effort");
+        assert_eq!(preflight(&set, &old).len(), 1);
+        assert!(preflight(&RolePlan::claude_default(), &old).is_empty());
+        let old_modes = with_unsupported("--permission-mode");
+        assert_eq!(preflight(&set, &old_modes).len(), 1);
+        assert!(preflight(&RolePlan::claude_default(), &old_modes).is_empty());
     }
 
     #[test]

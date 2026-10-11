@@ -10,6 +10,7 @@ mod telemetry;
 mod model;
 mod prompt;
 mod pty;
+mod roles;
 mod scroll;
 mod ui;
 
@@ -74,6 +75,9 @@ fn data_home() -> PathBuf {
 }
 fn prefs_path() -> PathBuf {
     data_home().join("prefs.json")
+}
+fn roles_path() -> PathBuf {
+    data_home().join("roles.json")
 }
 fn read_prefs() -> Prefs {
     fs::read_to_string(prefs_path())
@@ -192,6 +196,17 @@ pub struct App {
     pub capabilities_open: bool,
     /// Proven problems with the launch plan against `capabilities`. Empty means it may launch.
     pub launch_problems: Vec<capability::Diagnostic>,
+    /// Per-role model choices from `roles.json`. Only changed on Setup, so a running session always matches them.
+    pub role_settings: roles::Settings,
+    /// Problems found while loading or sanitizing `roles.json`, shown in the Roles overlay.
+    pub role_notices: Vec<String>,
+    /// F4 on Setup. Keys go to the overlay, not Claude, while it is open.
+    pub roles_open: bool,
+    /// Index into `roles::ROLES` for the overlay's selected row.
+    pub roles_row: usize,
+    pub roles_field: roles::Field,
+    /// Where `role_settings` is saved. Tests point this at a temporary file.
+    roles_file: PathBuf,
 }
 impl App {
     fn new(args: Args) -> Self {
@@ -214,12 +229,13 @@ impl App {
         let home = data_home();
         let session_id = Uuid::new_v4().to_string();
         let run_dir = home.join("runs").join(&session_id);
+        let (role_settings, role_notices) = roles::load(&roles_path());
         Self {
             page: Page::Setup,
             focus: Focus::Project,
             project,
             objective,
-            message: String::new(),
+            message: role_notices.first().cloned().unwrap_or_default(),
             recent: p.projects,
             browser_dir: PathBuf::new(),
             browser_entries: vec![],
@@ -263,12 +279,63 @@ impl App {
             capabilities: None,
             capabilities_open: false,
             launch_problems: Vec::new(),
+            role_settings,
+            role_notices,
+            roles_open: false,
+            roles_row: 0,
+            roles_field: roles::Field::Model,
+            roles_file: roles_path(),
         }
     }
     fn refresh_capabilities(&mut self, discovery: capability::Discovery) {
-        self.launch_problems =
-            capability::preflight(&capability::RolePlan::claude_default(), &discovery);
+        self.launch_problems = capability::preflight(&self.role_settings.plan(), &discovery);
         self.capabilities = Some(discovery);
+    }
+    /// Writes `roles.json` after a change. A failed write is reported, not hidden, and the choice stays in memory.
+    fn save_roles(&mut self) {
+        match roles::save(&self.roles_file, &self.role_settings) {
+            Ok(()) => self.role_notices.clear(),
+            Err(error) => self.message = format!("Role settings were not saved: {error}"),
+        }
+    }
+    fn handle_roles(&mut self, key: KeyEvent) {
+        let field_index = roles::FIELDS
+            .iter()
+            .position(|f| *f == self.roles_field)
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::F(4) => self.roles_open = false,
+            KeyCode::Up => self.roles_row = self.roles_row.saturating_sub(1),
+            KeyCode::Down => self.roles_row = (self.roles_row + 1).min(roles::ROLES.len() - 1),
+            KeyCode::Tab => {
+                self.roles_field = roles::FIELDS[(field_index + 1) % roles::FIELDS.len()]
+            }
+            KeyCode::BackTab => {
+                self.roles_field =
+                    roles::FIELDS[(field_index + roles::FIELDS.len() - 1) % roles::FIELDS.len()]
+            }
+            KeyCode::Right | KeyCode::Left => {
+                let step = if key.code == KeyCode::Right { 1 } else { -1 };
+                let role = roles::ROLES[self.roles_row];
+                if roles::options(role, self.roles_field).is_empty() {
+                    self.message = format!(
+                        "{} has no {} setting. {}",
+                        role.label(),
+                        self.roles_field.label(),
+                        roles::not_applicable_reason(role, self.roles_field)
+                    );
+                } else {
+                    self.role_settings.cycle(role, self.roles_field, step);
+                    self.save_roles();
+                }
+            }
+            KeyCode::Char('d' | 'D') => {
+                let role = roles::ROLES[self.roles_row];
+                self.role_settings.reset(role);
+                self.save_roles();
+            }
+            _ => {}
+        }
     }
     /// Blocks the launch with the first problem and opens the matrix when the plan is invalid.
     fn check_launch(&mut self, discovery: capability::Discovery) -> Result<()> {
@@ -483,12 +550,13 @@ impl App {
         self.run_dir = data_home().join("runs").join(&self.session_id);
         self.attention_file = self.run_dir.join("attention.json");
         fs::create_dir_all(&self.run_dir)?;
+        let plan = self.role_settings.plan();
         let policy_file = self.run_dir.join("instructions.txt");
         fs::write(
             &policy_file,
-            prompt::system_policy(&self.attention_file, &self.session_id),
+            prompt::system_policy(&self.attention_file, &self.session_id, &plan),
         )?;
-        let initial = prompt::initial_objective(&self.objective);
+        let initial = prompt::initial_objective(&self.objective, &plan);
         self.terminal_expanded = false;
         self.dashboard_expanded = false;
         let (rows, cols) = ui::native_dimensions(area, self.terminal_expanded);
@@ -503,7 +571,7 @@ impl App {
         if let Some(cli) = cli {
             self.session = Some(pty::spawn(
                 &cli,
-                &capability::RolePlan::claude_default(),
+                &plan,
                 &project,
                 &self.session_id,
                 &policy_file,
@@ -854,6 +922,11 @@ impl App {
             }
             return false;
         }
+        // The Roles overlay is modal too: it takes its own keys and nothing reaches Claude.
+        if self.roles_open {
+            self.handle_roles(key);
+            return false;
+        }
         // F1 opens the controls panel on every page. While it is open, keys never reach Claude.
         if key.code == KeyCode::F(1) {
             self.help_open = !self.help_open;
@@ -895,6 +968,7 @@ impl App {
                             self.message = e.to_string();
                         }
                     }
+                    KeyCode::F(4) => self.roles_open = true,
                     KeyCode::F(7) => {
                         let discovery = capability::discover(pty::cli_path().ok().as_deref());
                         self.refresh_capabilities(discovery);
@@ -1555,6 +1629,70 @@ mod tests {
             .trim_end()
             .to_owned()
     }
+    /// Setup with default role settings saved to a temporary file, never the user's `roles.json`.
+    fn roles_app() -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("agentree-app-roles-{}", Uuid::new_v4()));
+        let file = dir.join("roles.json");
+        let mut a = App::new(Args {
+            project: Some(std::env::current_dir().unwrap()),
+            issue: None,
+            objective: None,
+            demo: true,
+        });
+        a.roles_file = file;
+        a.role_settings = roles::Settings::default();
+        a.role_notices.clear();
+        (a, dir)
+    }
+    #[test]
+    fn roles_overlay_saves_each_change_and_the_next_plan_uses_it() {
+        let (mut a, dir) = roles_app();
+        assert!(!a.handle(key(KeyCode::F(4), KeyModifiers::NONE), AREA));
+        assert!(a.roles_open);
+        // Lead row, effort field: default -> low.
+        a.handle(key(KeyCode::Tab, KeyModifiers::NONE), AREA);
+        assert_eq!(a.roles_field, roles::Field::Effort);
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        assert_eq!(a.role_settings.plan().effort.as_deref(), Some("low"));
+        assert_eq!(roles::load(&a.roles_file).0.lead.effort, "low");
+        // Keys stay in the overlay: the Setup objective is untouched.
+        let objective = a.objective.clone();
+        a.handle(key(KeyCode::Char('x'), KeyModifiers::NONE), AREA);
+        assert_eq!(a.objective, objective);
+        a.handle(key(KeyCode::Esc, KeyModifiers::NONE), AREA);
+        assert!(!a.roles_open);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn roles_overlay_explains_a_field_that_does_not_apply() {
+        let (mut a, dir) = roles_app();
+        a.roles_open = true;
+        // Lead row has no concurrency setting.
+        a.roles_field = roles::Field::Concurrency;
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        assert!(
+            a.message.contains("Lead has no concurrency setting"),
+            "{}",
+            a.message
+        );
+        assert!(!a.roles_file.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn roles_overlay_reset_restores_the_selected_role() {
+        let (mut a, dir) = roles_app();
+        a.roles_open = true;
+        a.roles_row = 4; // Coder
+        a.roles_field = roles::Field::Concurrency;
+        a.handle(key(KeyCode::Right, KeyModifiers::NONE), AREA);
+        assert_eq!(a.role_settings.coder.concurrency, 4);
+        a.handle(key(KeyCode::Char('d'), KeyModifiers::NONE), AREA);
+        assert_eq!(a.role_settings.coder, roles::Settings::default().coder);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn ctrl_scroll_keys_are_never_forwarded_to_claude() {
         let mut a = running_app();

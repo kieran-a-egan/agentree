@@ -30,6 +30,21 @@ Fix: run `claude update`, confirm `claude --version`, then press **F5** again. I
 
 `unverified` rows in the matrix are not failures. They can only be confirmed in a live session.
 
+## Role settings
+
+**Reset a role:** open the Roles overlay with **F4** on the setup screen, select the role, and press **d**. This restores that role's defaults.
+
+**Reset everything:** delete `%LOCALAPPDATA%\ClaudeAgentTree\roles.json`. A missing file means the defaults. The file is written again the next time you change a setting.
+
+**Warnings in the overlay:**
+
+- `<Role> <setting> '<value>' is not supported; using <default>.` The value in `roles.json` was edited by hand to one the overlay does not offer. Agentree uses the default for that setting. Choose the value again in the overlay, or fix the file.
+- `roles.json could not be read (...); using defaults.` The file exists but cannot be read or parsed. Agentree uses the defaults and leaves the file alone until you change a setting. Fix the JSON, or delete the file.
+
+**`NOT SUPPORTED` for Effort level or Permission modes (F7):** the installed Claude Code CLI rejects `--effort` or `--permission-mode`. The launch is blocked only when the lead's effort or permission mode is set to something other than default, because only then does the plan need the flag. Fix: run `claude update`, then press **F5** again, or set the lead's effort and permission mode back to default. Not verified in a live session.
+
+Teammate models, concurrency limits and permission modes are instructions to the lead, not launch flags. Agentree cannot confirm that a teammate follows them. A teammate that ignores one is not a launch failure; check the Claude terminal.
+
 ## Teammates are missing from the dashboard
 
 Claude may run named teammates, background subagents, or no parallel workers, depending on the task and available tools. Agentree only links a native team when the local Claude records match the active project/session with sufficient confidence. Check the embedded Claude terminal before assuming work has stopped.
