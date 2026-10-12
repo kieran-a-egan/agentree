@@ -8,6 +8,10 @@ mod telemetry;
 #[allow(dead_code)]
 // Approval/Run/Stage have no runtime consumer until v0.6+; tests pin the wire format.
 mod model;
+// `Store::activate` and the skill and MCP details have no launch consumer until the v0.6 Claude
+// adapter; the loader and trust rules are covered by tests and the `--plugin` command.
+#[allow(dead_code)]
+mod plugins;
 mod profiles;
 mod prompt;
 mod pty;
@@ -40,7 +44,7 @@ use std::{
 };
 use uuid::Uuid;
 
-#[derive(Parser)]
+#[derive(Parser, Default)]
 #[command(
     name = "agentree",
     version,
@@ -60,6 +64,19 @@ struct Args {
     objective: Option<String>,
     #[arg(long)]
     demo: bool,
+    /// Inspect an Agent Plugins v1.0 folder without starting a session.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["project", "issue", "objective", "demo"]
+    )]
+    plugin: Option<PathBuf>,
+    /// With --plugin: trust the plugin as it is now, letting runs use its skills and MCP servers.
+    #[arg(long, requires = "plugin", conflicts_with = "plugin_revoke")]
+    plugin_trust: bool,
+    /// With --plugin: withdraw trust from the plugin.
+    #[arg(long, requires = "plugin")]
+    plugin_revoke: bool,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Prefs {
@@ -94,6 +111,14 @@ fn legacy_roles_path() -> PathBuf {
 }
 fn profiles_path() -> PathBuf {
     data_home().join("profiles.json")
+}
+/// Which plugin folders the user trusted, and the contents trusted. See `plugins::Store`.
+fn plugins_path() -> PathBuf {
+    data_home().join("plugins.json")
+}
+/// Parent of each plugin's persistent `PLUGIN_DATA` folder.
+fn plugin_data_path() -> PathBuf {
+    data_home().join("plugin-data")
 }
 fn read_prefs() -> Prefs {
     fs::read_to_string(prefs_path())
@@ -1405,7 +1430,15 @@ fn dashboard(args: Args) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
-    dashboard(Args::parse())
+    let args = Args::parse();
+    if let Some(dir) = &args.plugin {
+        let (data, store) = (plugin_data_path(), plugins_path());
+        let report = plugins::command(dir, &data, &store, args.plugin_trust, args.plugin_revoke)
+            .map_err(anyhow::Error::msg)?;
+        print!("{report}");
+        return Ok(());
+    }
+    dashboard(args)
 }
 
 #[cfg(test)]
@@ -1429,6 +1462,7 @@ mod tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Args::default()
         });
         a.finished_elapsed = Some(Duration::from_secs(42));
         assert_eq!(a.run_elapsed(), Duration::from_secs(42));
@@ -1449,12 +1483,27 @@ mod tests {
             .is_none());
     }
     #[test]
+    fn plugin_flags_leave_the_normal_launch_alone() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("agentree").chain(args.iter().copied()))
+        };
+        let plain = parse(&[]).unwrap();
+        assert!(plain.plugin.is_none() && !plain.plugin_trust && !plain.plugin_revoke);
+        assert!(parse(&["--project", "C:/r"]).unwrap().plugin.is_none());
+        assert!(parse(&["--plugin", "C:/p"]).is_ok());
+        assert!(parse(&["--plugin", "C:/p", "--plugin-trust"]).is_ok());
+        assert!(parse(&["--plugin", "C:/p", "--project", "C:/r"]).is_err());
+        assert!(parse(&["--plugin-trust"]).is_err());
+        assert!(parse(&["--plugin", "C:/p", "--plugin-trust", "--plugin-revoke"]).is_err());
+    }
+    #[test]
     fn issue_startup_never_restores_saved_objective() {
         let a = App::new(Args {
             project: Some(std::env::current_dir().unwrap()),
             issue: Some(38),
             objective: None,
             demo: true,
+            ..Args::default()
         });
         assert!(a.objective.is_empty());
         assert_eq!(a.page, Page::Setup);
@@ -1466,6 +1515,7 @@ mod tests {
             issue: None,
             objective: Some("Ship the picker".into()),
             demo: true,
+            ..Args::default()
         });
         assert_eq!(a.objective, "Ship the picker");
         assert_eq!(a.page, Page::Setup);
@@ -1478,6 +1528,7 @@ mod tests {
             issue: None,
             objective: Some("old text".into()),
             demo: true,
+            ..Args::default()
         });
         let repo = github::RepoRef {
             owner: "acme".into(),
@@ -1507,6 +1558,7 @@ mod tests {
             issue: None,
             objective: Some(String::new()),
             demo: true,
+            ..Args::default()
         };
         let mut a = App::new(args);
         assert!(a.start(ratatui::layout::Rect::new(0, 0, 140, 40)).is_err());
@@ -1532,6 +1584,7 @@ mod tests {
             issue: None,
             objective: Some("Do the thing".into()),
             demo: true,
+            ..Args::default()
         });
         let err = a.check_launch(old_cli).unwrap_err().to_string();
         assert!(err.starts_with("Launch blocked:"), "{err}");
@@ -1560,6 +1613,7 @@ mod tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Args::default()
         });
         a.objective.clear();
         a
@@ -1704,6 +1758,7 @@ mod tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Args::default()
         });
         a.page = Page::Running;
         a.focus = Focus::Native;
@@ -1738,6 +1793,7 @@ mod tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Args::default()
         });
         a.profiles_file = file;
         a.profiles = profiles::Store::default();
@@ -2048,6 +2104,7 @@ mod tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Args::default()
         });
         a.page = Page::Issues;
         let body = (0..body_lines)
@@ -2123,6 +2180,7 @@ mod tests {
                     .join("\n"),
             ),
             demo: true,
+            ..Args::default()
         });
         a.focus = Focus::Objective;
         let at_top = draw_text(&a, 120, 30);
@@ -2175,6 +2233,7 @@ mod tests {
                                 ),
                         ),
                         demo: true,
+                        ..Args::default()
                     });
                     s.page = page;
                     s.help_open = help;

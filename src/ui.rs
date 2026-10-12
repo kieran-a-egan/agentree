@@ -1669,6 +1669,7 @@ mod issue_page_tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Default::default()
         });
         app.page = Page::Issues;
         app.issues = IssueBrowser {
@@ -1741,6 +1742,7 @@ mod capability_overlay_tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Default::default()
         });
         app.capabilities = Some(Discovery {
             cli: Some("C:/tools/claude.exe".into()),
@@ -1826,6 +1828,7 @@ mod roles_overlay_tests {
             issue: None,
             objective: None,
             demo: true,
+            ..Default::default()
         });
         app.roles_open = true;
         let text = screen(80, 24, &app);
