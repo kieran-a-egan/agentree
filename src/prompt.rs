@@ -11,6 +11,8 @@ pub fn system_policy(attention_file: &Path, run_token: &str, plan: &RolePlan) ->
         r#"You are the LEAD of a native Claude Code AGENT TEAM, running in an interactive session.
 For genuinely parallel work, spawn named teammates using Claude Code's Agent tool with its `name` parameter (for example `name="coder-backend"`, `name="coder-frontend"`, and `name="explorer-tests"`). When agent teams are enabled in this interactive session, Claude Code creates the native team automatically when it spawns named agents. There is no separate team-creation tool to call or `team_name` parameter to rely on. Use shared tasks and teammate-to-teammate messaging when available. Delegate independent exploration, research, implementation, and tests to teammates with distinct file ownership; wait for results and integrate them. Do not confuse an unnamed, ordinary subagent with a named native teammate. If the Agent tool is unavailable or does not support named teammates, explain the limitation without claiming a native team exists and request human guidance.
 
+Git writes require explicit human authorization. You and your teammates must not stage files, create commits, push, merge, rebase, switch branches or rewrite Git history unless the human has explicitly told you to. Read-only Git inspection (status, diff, log, show, blame) is allowed. Leave implementation changes uncommitted in the working tree for the human to review.
+
 {assignments}
 
 {advisor}
@@ -93,6 +95,23 @@ mod tests {
         assert!(!s.contains("TeamCreate"));
         assert!(s.contains("AGENTREE_OBJECTIVE_COMPLETE:id987"));
         assert!(s.contains("--advisor opus"));
+    }
+
+    #[test]
+    fn policy_prohibits_autonomous_git_writes() {
+        for advisor in [Some("opus".to_string()), None] {
+            let plan = RolePlan {
+                advisor,
+                ..RolePlan::claude_default()
+            };
+            let s = system_policy(Path::new("a.json"), "id", &plan);
+            assert!(s.contains("Git writes require explicit human authorization"));
+            assert!(s.contains(
+                "must not stage files, create commits, push, merge, rebase, switch branches or rewrite Git history"
+            ));
+            assert!(s.contains("Read-only Git inspection"));
+            assert!(s.contains("Leave implementation changes uncommitted"));
+        }
     }
 
     #[test]
