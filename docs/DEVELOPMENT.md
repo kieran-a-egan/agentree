@@ -64,6 +64,7 @@ Manual, on a Windows machine with Claude signed in (CI has no credentials):
 | `src/capability.rs` | Claude Code capability matrix, launch-plan preflight and the flag probes behind them |
 | `src/roles.rs` | Per-role model settings: the Roles overlay options, validation, launch notes and the launch plan they produce |
 | `src/profiles.rs` | Saved profiles, per-project overrides, credential references and `roles.json` migration (`profiles.json`) |
+| `src/plugins.rs` | Agent Plugins v1.0 loader: manifest, skill and MCP validation, path containment, and the trust store (`plugins.json`). See [PLUGINS.md](PLUGINS.md) |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |

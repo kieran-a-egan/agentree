@@ -161,6 +161,18 @@ With the advisor set to **off**, Opus is not consulted, so a final review can on
 
 Not in this version: custom profile creation from the overlay (add one by editing `profiles.json`), and the `bypassPermissions`, `auto`, `dontAsk` and `manual` permission modes. Claude Code is the only backend. Pi and local models are planned for v0.7.
 
+## Agent Plugins
+
+Agentree can load [Agent Plugins v1.0](https://agent-plugins.org) folders (skills, references and MCP server declarations). A plugin is validated, never run on load, and does nothing until you trust it:
+
+```powershell
+agentree --plugin C:\path\to\plugin                  # inspect: skills, MCP commands, problems
+agentree --plugin C:\path\to\plugin --plugin-trust   # trust it as it is now
+agentree --plugin C:\path\to\plugin --plugin-revoke  # withdraw trust
+```
+
+Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). Plugins are not yet used by a run; role mapping and the Claude adapter arrive later in v0.6.
+
 ## Use a GitHub issue
 
 Pass an issue number with `--project` to load it at startup:
