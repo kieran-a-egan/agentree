@@ -79,6 +79,24 @@ impl Role {
         ROLES.into_iter().find(|r| r.key() == key)
     }
 
+    /// The skill this role uses from the built-in `software-engineering` plugin
+    /// (`plugins/software-engineering`). The Lead coordinates and has none. Each skill belongs to
+    /// one role and can be loaded without the others.
+    // ponytail: a fixed table; user-defined role/skill mappings arrive with role definitions (#9).
+    #[allow(dead_code)] // No launch consumer until the v0.6 Claude adapter; covered by tests.
+    pub fn skill(self) -> Option<&'static str> {
+        match self {
+            Role::Lead => None,
+            Role::Planner => Some("plan"),
+            Role::Explorer => Some("explore"),
+            Role::Researcher => Some("research"),
+            Role::Coder => Some("implement"),
+            Role::Tester => Some("test"),
+            Role::Advisor => Some("advise"),
+            Role::FinalReviewer => Some("review"),
+        }
+    }
+
     /// Named teammates that Claude spawns inside the lead's session.
     pub fn is_teammate(self) -> bool {
         matches!(
@@ -482,5 +500,63 @@ mod tests {
             assert_eq!(Role::from_key(role.key()), Some(role));
         }
         assert_eq!(Role::from_key("nobody"), None);
+    }
+
+    fn builtin() -> (std::path::PathBuf, crate::plugins::Plugin) {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/software-engineering");
+        let plugin = crate::plugins::load(&dir, &std::env::temp_dir()).unwrap();
+        (dir, plugin)
+    }
+
+    #[test]
+    fn the_builtin_plugin_loads_cleanly_with_one_skill_per_role() {
+        let (_, plugin) = builtin();
+        assert!(plugin.issues.is_empty(), "{:?}", plugin.issues);
+        assert_eq!(plugin.manifest.name, "software-engineering");
+        let mut names: Vec<_> = plugin.skills.iter().map(|s| s.name.as_str()).collect();
+        names.sort_unstable();
+        let mut wanted: Vec<_> = ROLES.iter().filter_map(|r| r.skill()).collect();
+        wanted.sort_unstable();
+        assert_eq!(names, wanted);
+        assert_eq!(wanted.len(), 7);
+        assert_eq!(Role::Lead.skill(), None);
+    }
+
+    #[test]
+    fn each_skill_documents_inputs_and_outputs() {
+        let (dir, _) = builtin();
+        for role in ROLES {
+            let Some(skill) = role.skill() else { continue };
+            let text =
+                std::fs::read_to_string(dir.join("skills").join(skill).join("SKILL.md")).unwrap();
+            for heading in ["## Inputs", "## Outputs", "## Limits"] {
+                assert!(text.contains(heading), "{skill} lacks {heading}");
+            }
+            assert!(
+                text.contains("(required)"),
+                "{skill} names no required input"
+            );
+        }
+    }
+
+    #[test]
+    fn a_role_selects_its_own_skill_and_only_trust_activates_it() {
+        use crate::plugins::{State, Store};
+        let (_, plugin) = builtin();
+        let mut store = Store::default();
+        assert!(store.activate(&plugin).is_none());
+        store.trust(&plugin).unwrap();
+        assert_eq!(store.state(&plugin), State::Trusted);
+        let active = store.activate(&plugin).unwrap();
+        assert!(active.mcp.is_empty());
+        for role in ROLES {
+            let picked: Vec<_> = active
+                .skills
+                .iter()
+                .filter(|s| Some(s.name.as_str()) == role.skill())
+                .collect();
+            assert_eq!(picked.len(), role.skill().iter().count(), "{}", role.key());
+        }
     }
 }

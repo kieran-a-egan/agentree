@@ -37,6 +37,22 @@ A server that fails is skipped and reported; a bad `mcp.json` disables MCP for t
 
 Everything skipped or ignored is listed as a *note* by `--plugin`.
 
+## Built-in software-engineering plugin
+
+[`plugins/software-engineering`](../plugins/software-engineering) lives in this repository: seven skills, no MCP servers. Each is a self-contained folder, so a role can use one without the others, and each `SKILL.md` documents its **Inputs**, **Procedure**, **Outputs** and **Limits**.
+
+| Role | Skill | Takes | Produces | Edits files |
+| --- | --- | --- | --- | --- |
+| Planner | `plan` | objective, context | ordered tasks with owners, files and done-checks | no |
+| Explorer | `explore` | question, scope | answer with `file:line` evidence | no |
+| Researcher | `research` | topic, decision, constraints | sourced findings and confidence | no |
+| Coder | `implement` | task, owned files | changes and verification | owned files only |
+| Tester | `test` | change, commands | result, commands run, tests added | test files only |
+| Advisor | `advise` | question, evidence | one recommendation with reasoning | no |
+| Final reviewer | `review` | diff, objective, evidence | `PASS` / `NEEDS_CHANGES` / `BLOCKED` with findings | no |
+
+`roles::Role::skill()` is a fixed role-to-skill table; the Lead has none. Configurable role and workflow definitions are a separate v0.6 issue (#9). The advisor and final reviewer run through Claude's parameterless advisor tool, which cannot load a skill itself, so the lead has to supply the `advise` or `review` text when it consults the advisor. Tests check that the plugin loads with no issues, that every role resolves to exactly one skill, and that each `SKILL.md` has Inputs, Outputs and Limits sections. The plugin is trusted like any other (`agentree --plugin plugins\software-engineering --plugin-trust`); it is not yet used by a run, and the installer does not copy it next to the binary (that comes with the Claude adapter), so the native-team launch and the lead prompt are unchanged.
+
 ## Trust
 
 A plugin starts untrusted. Untrusted, or changed since it was trusted, it activates nothing: `plugins::Store::activate` returns no skills and no MCP servers, and the launch path must obtain them only through it. A repository can therefore ship a plugin but cannot turn it on.
@@ -59,6 +75,6 @@ A plugin may contain at most 10,000 entries and 64 MiB; larger ones are refused.
 
 ## Not in this version
 
-- The built-in engineering plugin, role/workflow definitions and the Claude adapter that turn trusted skills into a team workflow arrive in later v0.6 issues. Until then `--plugin` is how you inspect and trust; nothing launches a plugin's MCP servers yet.
+- Role/workflow definitions and the Claude adapter that turn trusted skills into a team workflow arrive in later v0.6 issues. Until then `--plugin` is how you inspect and trust; nothing launches a plugin's MCP servers yet.
 - `PLUGIN_DATA` folders (`%LOCALAPPDATA%\ClaudeAgentTree\plugin-data\<name>`) are computed but created only when a server is launched.
 - Skill frontmatter is checked for the fields the Agent Skills specification requires, not for every optional field.
