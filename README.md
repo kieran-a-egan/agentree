@@ -2,7 +2,7 @@
 
 **Agentree** is a Windows terminal dashboard for [Claude Code](https://code.claude.com/docs/en/overview) and its native Agent Teams. It gives you one place to choose a project, describe an objective, work with Claude, and watch the team make progress.
 
-The dashboard displays teammates, current tool activity, elapsed time, token usage, approximate context usage, and estimated API-list-price costs. It keeps Claude's interactive terminal embedded, including permission requests and questions. Agentree uses **Haiku 5.5** for the team lead and workers, with **Opus 5.5** available for advice and final review.
+The dashboard displays teammates, current tool activity, elapsed time, token usage, approximate context usage, and estimated API-list-price costs. It keeps Claude's interactive terminal embedded, including permission requests and questions. By default Agentree uses **Haiku 5.5** for the team lead and workers, with **Opus 5.5** available for advice and final review; each role's model, effort, concurrency and permission mode can be changed in [Role models and profiles](#role-models-and-profiles).
 
 Agentree is an observer and terminal host, **not a replacement for Claude Code**. Agent creation, delegation, advice, and review are handled by Claude. Some activity and usage information may be delayed or unavailable; cost and context figures are estimates.
 
