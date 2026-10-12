@@ -171,7 +171,7 @@ agentree --plugin C:\path\to\plugin --plugin-trust   # trust it as it is now
 agentree --plugin C:\path\to\plugin --plugin-revoke  # withdraw trust
 ```
 
-Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). Plugins are not yet used by a run; role mapping and the Claude adapter arrive later in v0.6.
+Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). A built-in `plugins/software-engineering` plugin provides plan, explore, research, implement, test, advise and review skills, one per role. Plugins are not yet used by a run; the Claude adapter arrives later in v0.6.
 
 ## Use a GitHub issue
 
