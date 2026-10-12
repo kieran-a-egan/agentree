@@ -8,6 +8,9 @@
 //! Trust is kept in the user's data folder (`plugins.json`), never in the repository, so a cloned
 //! repository cannot enable its own plugins. A grant is bound to the plugin's folder and to a
 //! SHA-256 of every file in it: any edit, from `mcp.json` to a bundled script, revokes it.
+//! The check is made against the disk at the moment of use ([`Store::trust`], [`Store::state`],
+//! [`Store::activate`] re-hash the folder), never from a stored [`Plugin`] alone. It is a
+//! point-in-time check, not a lock: a file may still change between it and a later launch.
 //!
 //! Failures follow the specification's boundaries: a bad manifest rejects the plugin, a bad
 //! skill or MCP entry is skipped and reported in [`Plugin::issues`], and valid siblings load.
@@ -159,6 +162,9 @@ pub fn load(dir: &Path, data_base: &Path) -> Result<Plugin, String> {
     let manifest_path = contained(&root, &root.join("plugin.json"))
         .filter(|p| p.is_file())
         .ok_or("plugin.json is missing, or is not a file inside the plugin folder")?;
+    // Hashed before and after parsing. This catches a change that is still in place after the
+    // parse; it cannot catch one that is made and then reverted between the two hashes.
+    let before = fingerprint(&root)?;
     let text = read_text(&manifest_path).map_err(|e| format!("plugin.json: {e}"))?;
     let mut issues = Vec::new();
     let manifest = parse_manifest(&text, &mut issues)?;
@@ -166,6 +172,9 @@ pub fn load(dir: &Path, data_base: &Path) -> Result<Plugin, String> {
     let skills = discover_skills(&root, &mut issues);
     let mcp = load_mcp(&root, &data, &mut issues);
     let fingerprint = fingerprint(&root)?;
+    if fingerprint != before {
+        return Err("the plugin changed while it was being loaded; try again".into());
+    }
     Ok(Plugin {
         root,
         data,
@@ -318,6 +327,14 @@ fn discover_skills(root: &Path, issues: &mut Vec<String>) -> Vec<Skill> {
         if !child.path().is_dir() {
             continue;
         }
+        // Resolved before it is listed: a link out of the plugin is never enumerated.
+        if contained(root, &child.path()).is_none() {
+            issues.push(format!(
+                "skill '{}' skipped: it resolves outside the plugin.",
+                clip(&name)
+            ));
+            continue;
+        }
         // Only an exact SKILL.md makes a folder a skill (not skill.md on a case-blind disk).
         let has_skill_md = fs::read_dir(child.path())
             .map(|rd| {
@@ -360,7 +377,29 @@ fn load_skill(
     }
     let mut references = Vec::new();
     let refs = real.join("references");
-    if refs.is_dir() {
+    // The directory itself is resolved and checked before it is listed, so a link (symlink or
+    // junction) leaving the plugin is neither enumerated nor allowed to name its contents.
+    // Listing then uses the resolved path.
+    let refs = match fs::symlink_metadata(&refs) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            issues.push(format!("skill '{}': references: {e}; skipped.", clip(name)));
+            None
+        }
+        Ok(_) => match contained(root, &refs) {
+            Some(r) if r.is_dir() => Some(r),
+            Some(_) => None,
+            None => {
+                issues.push(format!(
+                    "skill '{}': references resolves outside the plugin or cannot be resolved; \
+                     skipped.",
+                    clip(name)
+                ));
+                None
+            }
+        },
+    };
+    if let Some(refs) = refs {
         let mut files: Vec<_> = fs::read_dir(&refs)
             .map(|rd| rd.filter_map(Result::ok).collect())
             .unwrap_or_default();
@@ -675,6 +714,18 @@ fn fingerprint(root: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Ok only if `plugin.root` still resolves to itself and its contents hash to the fingerprint
+/// taken at load. Any difference or read failure is an error, so callers fail closed.
+fn unchanged(plugin: &Plugin) -> Result<(), String> {
+    if canon(&plugin.root).ok().as_ref() != Some(&plugin.root) {
+        return Err("the plugin folder is missing or now resolves elsewhere".into());
+    }
+    if fingerprint(&plugin.root)? != plugin.fingerprint {
+        return Err("the plugin changed after it was loaded; load it again and review it".into());
+    }
+    Ok(())
+}
+
 /// Where a plugin stands with the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -689,7 +740,7 @@ impl State {
     pub fn label(self) -> &'static str {
         match self {
             State::Untrusted => "not trusted",
-            State::Changed => "changed since it was trusted; not trusted",
+            State::Changed => "changed or unreadable since it was trusted or loaded; not trusted",
             State::Trusted => "trusted",
         }
     }
@@ -755,18 +806,29 @@ impl Store {
         })
     }
 
+    /// `Trusted` only if the folder on disk *right now* still hashes to what was loaded and to
+    /// what was granted. A changed, missing or unreadable file, or a relinked folder, is
+    /// `Changed` (or `Untrusted` with no grant): the answer never rests on the loaded object alone.
     pub fn state(&self, plugin: &Plugin) -> State {
-        match self.grants.get(&project_key(&plugin.root)) {
-            None => State::Untrusted,
-            Some(g) if g.fingerprint == plugin.fingerprint && g.name == plugin.manifest.name => {
-                State::Trusted
-            }
-            Some(_) => State::Changed,
+        let Some(g) = self.grants.get(&project_key(&plugin.root)) else {
+            return State::Untrusted;
+        };
+        if g.fingerprint == plugin.fingerprint
+            && g.name == plugin.manifest.name
+            && unchanged(plugin).is_ok()
+        {
+            State::Trusted
+        } else {
+            State::Changed
         }
     }
 
     /// The skills and MCP servers a run may use, or `None` unless the plugin is trusted at its
     /// current contents. Anything that starts a plugin's tools must go through this.
+    ///
+    /// The contents are re-hashed on every call. Between this check and the launch that uses
+    /// the result a file can still change; launching must therefore call this immediately
+    /// before starting anything, and a launcher cannot make that window zero.
     pub fn activate<'a>(&self, plugin: &'a Plugin) -> Option<Activation<'a>> {
         (self.state(plugin) == State::Trusted).then_some(Activation {
             skills: &plugin.skills,
@@ -774,7 +836,10 @@ impl Store {
         })
     }
 
-    pub fn trust(&mut self, plugin: &Plugin) {
+    /// Grants trust to the plugin as it is on disk now. Refused, and nothing is recorded, if the
+    /// folder no longer matches the `plugin` that was loaded and shown for review.
+    pub fn trust(&mut self, plugin: &Plugin) -> Result<(), String> {
+        unchanged(plugin)?;
         self.grants.insert(
             project_key(&plugin.root),
             Grant {
@@ -782,6 +847,7 @@ impl Store {
                 fingerprint: plugin.fingerprint.clone(),
             },
         );
+        Ok(())
     }
 
     /// Drops the grant for the plugin in `dir`, whether or not it still loads.
@@ -892,7 +958,7 @@ pub fn command(
     }
     let plugin = load(dir, data_base)?;
     if trust {
-        store.trust(&plugin);
+        store.trust(&plugin)?;
         save(&store)?;
     }
     let mut out = report(&plugin, store.state(&plugin));
@@ -1090,6 +1156,13 @@ mod tests {
                 .is_ok_and(|o| o.status.success());
     }
 
+    /// Removes a directory link itself (never its target) on every platform.
+    fn unlink(link: &Path) {
+        fs::remove_dir(link)
+            .or_else(|_| fs::remove_file(link))
+            .unwrap();
+    }
+
     #[test]
     fn links_out_of_the_plugin_are_skipped_or_invalid() {
         let outside = Dir::new();
@@ -1121,9 +1194,86 @@ description: x
         assert_eq!(names, ["good"], "{:?}", p.issues);
         assert!(p.skills[0].references.is_empty());
         assert!(p.mcp.is_empty());
-        for needle in ["evil", "secret.txt", "'s' skipped", "'t' skipped"] {
+        for needle in ["evil", "references", "'s' skipped", "'t' skipped"] {
             assert!(p.issues.iter().any(|i| i.contains(needle)), "{needle}");
         }
+        // The linked-out folder is never listed, so none of its names can surface.
+        assert!(
+            p.issues.iter().all(|i| !i.contains("secret.txt")),
+            "{:?}",
+            p.issues
+        );
+    }
+
+    #[test]
+    fn references_link_out_is_not_enumerated_and_internal_links_still_work() {
+        let outside = Dir::new();
+        outside.write("secret.txt", "s");
+        let d = Dir::new();
+        d.write("plugin.json", &manifest(""));
+        skill(&d, "out");
+        skill(&d, "inside");
+        skill(&d, "mixed");
+        d.write("shared/a.md", "a");
+        d.write("skills/mixed/references/own.md", "own");
+        d.write("skills/mixed/references/ext.md", "x");
+        assert!(
+            link_dir(&d.0.join("skills/out/references"), &outside.0)
+                && link_dir(&d.0.join("skills/inside/references"), &d.0.join("shared"))
+        );
+        // A file link out of an otherwise internal folder is still skipped and reported.
+        fs::remove_file(d.0.join("skills/mixed/references/ext.md")).unwrap();
+        outside.write("ext.md", "x");
+        let file_link = {
+            #[cfg(unix)]
+            let r = std::os::unix::fs::symlink(
+                outside.0.join("ext.md"),
+                d.0.join("skills/mixed/references/ext.md"),
+            );
+            #[cfg(windows)]
+            let r = std::os::windows::fs::symlink_file(
+                outside.0.join("ext.md"),
+                d.0.join("skills/mixed/references/ext.md"),
+            );
+            r.is_ok()
+        };
+        let p = plugin(&d);
+        let by = |n: &str| p.skills.iter().find(|s| s.name == n).unwrap();
+        assert!(by("out").references.is_empty());
+        assert_eq!(by("inside").references.len(), 1);
+        assert!(by("inside").references[0].starts_with(&p.root));
+        assert!(by("mixed").references.iter().any(|r| r.ends_with("own.md")));
+        assert!(
+            p.issues.iter().all(|i| !i.contains("secret.txt")),
+            "{:?}",
+            p.issues
+        );
+        assert!(p
+            .issues
+            .iter()
+            .any(|i| i.contains("'out'") && i.contains("references")));
+        if file_link {
+            assert_eq!(by("mixed").references.len(), 1);
+            assert!(p.issues.iter().any(|i| i.contains("ext.md")));
+        }
+    }
+
+    #[test]
+    fn skill_folder_link_out_is_not_listed_even_without_a_skill_md() {
+        let outside = Dir::new();
+        outside.write("secret.txt", "s");
+        let d = Dir::new();
+        d.write("plugin.json", &manifest(""));
+        fs::create_dir_all(d.0.join("skills")).unwrap();
+        assert!(link_dir(&d.0.join("skills/ext"), &outside.0));
+        let p = plugin(&d);
+        assert!(p.skills.is_empty());
+        assert!(
+            p.issues.iter().any(|i| i.contains("'ext'")),
+            "{:?}",
+            p.issues
+        );
+        assert!(p.issues.iter().all(|i| !i.contains("secret.txt")));
     }
 
     #[test]
@@ -1246,7 +1396,7 @@ description: x
         );
         d.write("run.cmd", "echo safe");
         let mut store = Store::default();
-        store.trust(&plugin(&d));
+        store.trust(&plugin(&d)).unwrap();
         let loaded = plugin(&d);
         let a = store.activate(&loaded).expect("trusted plugin activates");
         assert_eq!((a.skills.len(), a.mcp.len()), (1, 1));
@@ -1254,13 +1404,154 @@ description: x
         let p = plugin(&d);
         assert_eq!(store.state(&p), State::Changed);
         assert!(store.activate(&p).is_none());
-        store.trust(&p);
+        store.trust(&p).unwrap();
         assert_eq!(store.state(&p), State::Trusted);
         d.write("skills/review/references/new.md", "more");
         assert_eq!(store.state(&plugin(&d)), State::Changed);
         assert!(store.revoke(&d.0));
         assert!(!store.revoke(&d.0));
         assert_eq!(store.state(&plugin(&d)), State::Untrusted);
+    }
+
+    fn bundled() -> (Dir, Plugin) {
+        let d = Dir::new();
+        d.write("plugin.json", &manifest(""));
+        skill(&d, "review");
+        d.write("run.cmd", "echo safe");
+        d.write(
+            "mcp.json",
+            &mcp(r#"{"s":{"type":"stdio","command":"./run.cmd"}}"#),
+        );
+        let p = plugin(&d);
+        (d, p)
+    }
+
+    /// Each edit is made *after* the `Plugin` was loaded, so only a fresh look at the disk can
+    /// notice it. The stale object must neither be trusted nor stay activated.
+    #[test]
+    fn a_plugin_edited_after_loading_cannot_be_trusted_or_activated() {
+        type Edit<'a> = (&'a str, &'a dyn Fn(&Dir));
+        let edits: [Edit; 5] = [
+            ("executable", &|d| d.write("run.cmd", "echo evil")),
+            ("mcp.json", &|d| {
+                d.write(
+                    "mcp.json",
+                    &mcp(r#"{"s":{"type":"stdio","command":"npx"}}"#),
+                );
+            }),
+            ("skill", &|d| {
+                d.write(
+                    "skills/review/SKILL.md",
+                    "---\nname: review\ndescription: Does it.\n---\nNew\n",
+                );
+            }),
+            ("deleted file", &|d| {
+                fs::remove_file(d.0.join("run.cmd")).unwrap()
+            }),
+            ("new file", &|d| {
+                d.write("skills/review/references/x.md", "x")
+            }),
+        ];
+        for (what, edit) in edits {
+            // Edited between load and trust: refused, and nothing is recorded.
+            let (d, p) = bundled();
+            edit(&d);
+            let mut store = Store::default();
+            assert!(store.trust(&p).is_err(), "{what}");
+            assert_eq!(store.state(&p), State::Untrusted, "{what}");
+            assert!(store.activate(&p).is_none(), "{what}");
+
+            // Edited between trust and activation: the stale object no longer activates, and
+            // neither does the object loaded afterwards until it is trusted again.
+            let (d, p) = bundled();
+            let mut store = Store::default();
+            store.trust(&p).unwrap();
+            assert!(store.activate(&p).is_some(), "{what}");
+            edit(&d);
+            assert_eq!(store.state(&p), State::Changed, "{what}");
+            assert!(store.activate(&p).is_none(), "{what}");
+            let fresh = plugin(&d);
+            assert!(store.activate(&fresh).is_none(), "{what}");
+
+            // Trusting the new contents does not revive the stale object, which still holds the
+            // old skills and servers.
+            store.trust(&fresh).unwrap();
+            assert!(store.activate(&fresh).is_some(), "{what}");
+            assert!(store.activate(&p).is_none(), "{what}");
+            assert!(store.trust(&p).is_err(), "{what}");
+            assert!(
+                store.activate(&fresh).is_some(),
+                "trust of fresh survives: {what}"
+            );
+        }
+    }
+
+    /// A file another process holds open exclusively cannot be hashed: fail closed, then recover.
+    #[cfg(windows)]
+    #[test]
+    fn an_unreadable_file_fails_closed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let (d, p) = bundled();
+        let mut store = Store::default();
+        store.trust(&p).unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(d.0.join("run.cmd"))
+            .unwrap();
+        assert_eq!(store.state(&p), State::Changed);
+        assert!(store.activate(&p).is_none());
+        assert!(store.trust(&p).is_err());
+        drop(held);
+        assert!(store.activate(&p).is_some());
+    }
+
+    #[test]
+    fn a_trusted_plugin_that_vanishes_or_is_relinked_is_not_activated() {
+        let (d, p) = bundled();
+        let mut store = Store::default();
+        store.trust(&p).unwrap();
+        // An empty copy is not a match for the trusted folder.
+        let moved = d.0.with_file_name(format!("moved-{}", Uuid::new_v4()));
+        fs::rename(&d.0, &moved).unwrap();
+        assert_eq!(store.state(&p), State::Changed);
+        assert!(store.activate(&p).is_none());
+        assert!(store.trust(&p).is_err());
+        // The folder replaced by a link to identical content is not the same folder.
+        let copy = Dir::new();
+        for f in [
+            "plugin.json",
+            "mcp.json",
+            "run.cmd",
+            "skills/review/SKILL.md",
+        ] {
+            copy.write(f, &fs::read_to_string(moved.join(f)).unwrap());
+        }
+        assert!(link_dir(&d.0, &copy.0), "could not create a directory link");
+        assert!(store.activate(&p).is_none());
+        assert!(store.trust(&p).is_err());
+        unlink(&d.0);
+        fs::rename(&moved, &d.0).unwrap();
+        assert!(
+            store.activate(&p).is_some(),
+            "moving it back restores trust"
+        );
+    }
+
+    #[test]
+    fn a_link_retargeted_after_loading_is_not_activated() {
+        let d = Dir::new();
+        d.write("plugin.json", &manifest(""));
+        d.write("impl-a/tool.cmd", "a");
+        d.write("impl-b/tool.cmd", "b");
+        assert!(link_dir(&d.0.join("bin"), &d.0.join("impl-a")));
+        let p = plugin(&d);
+        let mut store = Store::default();
+        store.trust(&p).unwrap();
+        unlink(&d.0.join("bin"));
+        assert!(link_dir(&d.0.join("bin"), &d.0.join("impl-b")));
+        assert!(store.activate(&p).is_none());
+        assert!(Store::default().trust(&p).is_err());
     }
 
     #[test]
@@ -1270,7 +1561,7 @@ description: x
             d.write("plugin.json", &manifest(""));
         }
         let mut store = Store::default();
-        store.trust(&plugin(&a));
+        store.trust(&plugin(&a)).unwrap();
         assert_eq!(store.state(&plugin(&a)), State::Trusted);
         assert_eq!(store.state(&plugin(&b)), State::Untrusted);
     }
@@ -1284,7 +1575,7 @@ description: x
                 .join(format!("plugins-{}.json", Uuid::new_v4()));
         let mut store = Store::load(&file);
         assert!(store.warning().is_none());
-        store.trust(&plugin(&d));
+        store.trust(&plugin(&d)).unwrap();
         store.save(&file).unwrap();
         assert_eq!(Store::load(&file).state(&plugin(&d)), State::Trusted);
 
@@ -1347,9 +1638,9 @@ description: x
         d.write("impl-b/tool.cmd", "b");
         assert!(link_dir(&d.0.join("bin"), &d.0.join("impl-a")));
         let mut store = Store::default();
-        store.trust(&plugin(&d));
+        store.trust(&plugin(&d)).unwrap();
         assert_eq!(store.state(&plugin(&d)), State::Trusted);
-        fs::remove_dir(d.0.join("bin")).unwrap();
+        unlink(&d.0.join("bin"));
         assert!(link_dir(&d.0.join("bin"), &d.0.join("impl-b")));
         assert_eq!(store.state(&plugin(&d)), State::Changed);
     }
