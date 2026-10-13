@@ -1,5 +1,6 @@
 mod capability;
 mod github;
+mod instructions;
 mod live;
 mod team;
 mod telemetry;
@@ -80,6 +81,13 @@ struct Args {
     /// With --plugin: withdraw trust from the plugin.
     #[arg(long, requires = "plugin")]
     plugin_revoke: bool,
+    /// Show which AGENTS.md / CLAUDE.md instructions a run in DIR would see, and any conflict.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["project", "issue", "objective", "demo", "plugin"]
+    )]
+    instructions: Option<PathBuf>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Prefs {
@@ -679,10 +687,18 @@ impl App {
         fs::create_dir_all(&self.run_dir)?;
         let plan = self.role_settings.plan();
         let policy_file = self.run_dir.join("instructions.txt");
+        let mut policy = prompt::system_policy(&self.attention_file, &self.session_id, &plan);
+        let resolved = instructions::resolve(&project);
+        if let Some(note) = resolved.lead_note() {
+            policy.push_str("\n\n");
+            policy.push_str(&note);
+        }
+        // Provenance for this run, next to the policy it produced.
         fs::write(
-            &policy_file,
-            prompt::system_policy(&self.attention_file, &self.session_id, &plan),
+            self.run_dir.join("instructions-resolved.txt"),
+            resolved.render(),
         )?;
+        fs::write(&policy_file, policy)?;
         let initial = prompt::initial_objective(&self.objective, &plan);
         self.terminal_expanded = false;
         self.dashboard_expanded = false;
@@ -709,6 +725,9 @@ impl App {
                 "Claude process launched. Waiting for terminal startup | {}",
                 self.session_id
             );
+            if let Some(line) = resolved.status_line() {
+                self.message.push_str(&format!(" | {line}"));
+            }
         } else {
             self.terminal.process(b"\x1b[32mDEMO - no Claude process launched\x1b[0m\r\nNative teammates and attention are simulated only in --demo mode.\r\n");
             self.message = "SIMULATED dashboard. No model calls, no edits.".into();
@@ -1441,6 +1460,10 @@ fn main() -> Result<()> {
         print!("{report}");
         return Ok(());
     }
+    if let Some(dir) = &args.instructions {
+        print!("{}", instructions::resolve(dir).render());
+        return Ok(());
+    }
     dashboard(args)
 }
 
@@ -1497,6 +1520,8 @@ mod tests {
         assert!(parse(&["--plugin", "C:/p", "--plugin-trust"]).is_ok());
         assert!(parse(&["--plugin", "C:/p", "--project", "C:/r"]).is_err());
         assert!(parse(&["--plugin-trust"]).is_err());
+        assert!(parse(&["--instructions", "C:/r"]).is_ok());
+        assert!(parse(&["--instructions", "C:/r", "--project", "C:/r"]).is_err());
         assert!(parse(&["--plugin", "C:/p", "--plugin-trust", "--plugin-revoke"]).is_err());
     }
     #[test]
