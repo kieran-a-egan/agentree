@@ -18,6 +18,9 @@ mod pty;
 mod roles;
 mod scroll;
 mod ui;
+// Workflow contracts (Issue #9): no launch consumer until the Claude adapter (#11); covered by tests.
+#[allow(dead_code)]
+mod workflow;
 
 use anyhow::{Context, Result};
 use clap::Parser;

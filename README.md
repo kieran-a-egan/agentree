@@ -173,6 +173,10 @@ agentree --plugin C:\path\to\plugin --plugin-revoke  # withdraw trust
 
 Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). A built-in `plugins/software-engineering` plugin provides plan, explore, research, implement, test, advise and review skills, one per role. Plugins are not yet used by a run; the Claude adapter arrives later in v0.6.
 
+### Workflow contracts
+
+Role and workflow definitions (`agentree.workflow/1`) describe which roles exist, which models they must use, how work is routed across Fast, Balanced and Thorough paths, and when final review is mandatory. Definitions are validated before anything could run. See [Workflow contracts](docs/WORKFLOWS.md). These contracts are not yet used by a launch; the Claude adapter arrives later in v0.6.
+
 ## Use a GitHub issue
 
 Pass an issue number with `--project` to load it at startup:

@@ -33,6 +33,8 @@ Agentree currently provides a Windows Ratatui dashboard, embedded Claude Code th
 
 ## v0.6 — Portable roles, Agent Plugins & AGENTS.md
 
+**Status:** Role/workflow definitions contract (#9) implemented as contracts and validation (`src/workflow/`, see [docs/WORKFLOWS.md](docs/WORKFLOWS.md)); launch integration pending the Claude adapter.
+
 **Outcome:** Role behaviour is defined once and reusable across runtimes.
 
 - Load and validate **Agent Plugins v1.0** manifests, bundled skills, references and MCP server declarations; apply path containment and explicit plugin trust/enablement rules.
