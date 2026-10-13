@@ -66,6 +66,8 @@ Manual, on a Windows machine with Claude signed in (CI has no credentials):
 | `src/profiles.rs` | Saved profiles, per-project overrides, credential references and `roles.json` migration (`profiles.json`) |
 | `src/plugins.rs` | Agent Plugins v1.0 loader: manifest, skill and MCP validation, path containment, and the trust store (`plugins.json`). See [PLUGINS.md](PLUGINS.md) |
 | `plugins/software-engineering/` | Built-in Agent Plugin: plan, explore, research, implement, test, advise and review skills. `roles::Role::skill` maps roles to skills. See [PLUGINS.md](PLUGINS.md#built-in-software-engineering-plugin) |
+| `src/workflow/` | Role and workflow contracts (`agentree.workflow/1`): validation, model registry and mandatory model policies, path routing, evidence handoffs and review. Contracts only; no launch uses them yet. See [WORKFLOWS.md](WORKFLOWS.md) |
+| `examples/workflows/` | Built-in software-engineering workflow definition. Regenerate it with `AGENTREE_WRITE_EXAMPLES=1 cargo test workflow`; a normal test run fails if it no longer matches the code |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
 | `src/model.rs` | Runtime-neutral `Run`, `Agent`, `Task`, `Stage`, `Usage`, `Approval` and `Event` types |
