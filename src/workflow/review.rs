@@ -51,6 +51,13 @@ pub struct VerificationResult {
     pub output_hash: Option<String>,
 }
 
+impl VerificationResult {
+    /// `Passed` is credible only without a nonzero process exit code.
+    fn contradictory(&self) -> bool {
+        self.status == VerificationStatus::Passed && self.exit_code.is_some_and(|c| c != 0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRef {
     pub id: String,
@@ -90,6 +97,13 @@ impl ReviewPacket {
         }
         if self.verification.is_empty() {
             bad("has no verification results");
+        }
+        for r in self.verification.iter().filter(|r| r.contradictory()) {
+            bad(&format!(
+                "verification '{}' is marked passed but reports exit code {}",
+                r.command,
+                r.exit_code.unwrap_or_default()
+            ));
         }
         if self.implementers.is_empty() {
             bad("does not say who implemented the change");
@@ -248,9 +262,9 @@ pub fn validate_verdict(
             if packet
                 .verification
                 .iter()
-                .any(|r| r.status != VerificationStatus::Passed)
+                .any(|r| r.status != VerificationStatus::Passed || r.contradictory())
             {
-                bad("a pass cannot rest on failed or missing verification");
+                bad("a pass cannot rest on failed, missing or contradictory verification");
             }
         }
         Verdict::NeedsChanges => {
@@ -424,6 +438,27 @@ mod tests {
             failure_scenario: "f".into(),
         });
         assert_eq!(validate_verdict(&partial, &a, &p).len(), 2);
+    }
+
+    #[test]
+    fn a_passed_result_with_a_nonzero_exit_code_cannot_support_a_pass() {
+        let mut p = packet();
+        p.verification[0].exit_code = Some(1);
+        // The packet itself is rejected, so no reviewer can be assigned to it.
+        assert!(p
+            .validate()
+            .iter()
+            .any(|v| v.message.contains("exit code 1")));
+        assert!(assign_reviewer(&p, &selection(), "reviewer-1").is_err());
+        // Even with an assignment built around it, the pass is refused.
+        let good = packet();
+        let a = assign_reviewer(&good, &selection(), "reviewer-1").unwrap();
+        let v = validate_verdict(&pass(&a), &a, &p);
+        assert!(v.iter().any(|v| v.message.contains("contradictory")));
+        // A failed result with a nonzero code is consistent, and a clean zero stays valid.
+        p.verification[0].status = VerificationStatus::Failed;
+        assert!(p.validate().is_empty());
+        assert!(packet().validate().is_empty());
     }
 
     #[test]

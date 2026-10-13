@@ -23,7 +23,7 @@ A definition is JSON with `"schema": "agentree.workflow/1"` and `"version": 1`. 
 | Section | Fields |
 | --- | --- |
 | `roles[]` | `id`; `class` (`planning`, `bulk_read`, `implementation`, `verification`, `review`); `model` (`policy`: `lowest_cost`, `strongest_review`, `configured`, or `pinned` with `model`); `skill` and `mcp` (plugin references, see below); `tools`; `permission` (`read_only` or `edit`); `data_class` (default `repository`); `max_concurrent` (1 to 4) |
-| `stages[]` | `id`; `role`; `depends_on`; `min_path` (default `fast`); `inputs[]` (`name`, `from: {stage, output}` or `null` for values the run supplies, `required`); `outputs[]` (`name`, `kind`: `evidence`, `plan`, `diff`, `verification`, `verdict`, `report`); `owns` (workspace paths, implementation stages only; `.` is the whole workspace); `policy` (`max_attempts` 1 to 3, `max_repair_cycles` 0 to 3, `on_exhausted`: `escalate` or `abort`); `inspection` (`max_requests` 1 to 8, `reader_role`) |
+| `stages[]` | `id`; `role`; `depends_on` (always waited for); `optional_depends_on` (waited for only when that stage is on the chosen path); `min_path` (default `fast`); `inputs[]` (`name`, `from: {stage, output}` or `null` for values the run supplies, `required`); `outputs[]` (`name`, `kind`: `evidence`, `plan`, `diff`, `verification`, `verdict`, `report`); `owns` (workspace paths, implementation stages only; `.` is the whole workspace; `/` and `\` are equal, case is ignored, `.` components and a trailing separator are dropped); `policy` (`max_attempts` 1 to 3, `max_repair_cycles` 0 to 3, `on_exhausted`: `escalate` or `abort`); `inspection` (`max_requests` 1 to 8, `reader_role`) |
 | `policy` | `allowed_capabilities` (default: all six tools); `max_path` (budget cap, default none); `strict_enforcement` (default `false`); `chunking` (`reserve_tokens`, `max_chunks`; `null` forbids chunking) |
 
 The tool names are `read`, `search`, `shell`, `edit`, `web` and `mcp`.
@@ -60,7 +60,7 @@ The decision has no model field. **Routing never selects models**, and a higher-
 - `context_tokens`, `tools`, `max_permission`, `data_classes`: what the model can do.
 - `available`: runtime availability, set from discovery or health checks. Selection never assumes it.
 
-`review_priority` is an explicit order, strongest first. When it is not empty it is also an allowlist: a model not listed is never a reviewer. When it is empty, `intelligence` ranks reviewers. `claude_default()` is the Claude Code registry (Haiku, Sonnet, Opus with aliases). Its numbers are defaults, and no selection code reads a model name.
+Reviewers are ranked by `intelligence`, always. `review_priority` only orders models of *equal* intelligence. A list that would put a weaker model ahead of, or leave out, a stronger one is a registry validation error, and selection ignores the conflict rather than obeying it. To keep a model from reviewing, restrict its `tools`, `max_permission` or `data_classes`: selection always honours those. `claude_default()` is the Claude Code registry (Haiku, Sonnet, Opus with aliases). Its numbers are defaults, and no selection code reads a model name.
 
 ### Bulk reading (`lowest_cost`)
 
@@ -77,7 +77,7 @@ A pricier model runs only when a human passes an `Authorization` naming it. An a
 
 ### Final review (`strongest_review`)
 
-The reviewer is the strongest eligible configured model (capable, large enough, first in review order). It is not necessarily the most expensive. If it is unavailable, the stage is blocked: the result is `NeedsAuthorization`, listing weaker available models. Only an `Authorization` naming one of them allows that weaker reviewer, and the selection records `authorized_downgrade`. Authorizing the unavailable model changes nothing.
+The reviewer is the strongest eligible configured model (capable, large enough, highest `intelligence`). It is not necessarily the most expensive. Equally strong models are interchangeable, so an available one of the strongest tier is used with no authorization. If none is available, the stage is blocked: the result is `NeedsAuthorization`, listing weaker available models. Only an `Authorization` naming one of them allows that weaker reviewer, and the selection records `authorized_downgrade`. Authorizing the unavailable model changes nothing.
 
 ## Evidence handoffs
 
@@ -94,7 +94,7 @@ A bulk reader returns a `Handoff`: compact claims (1 to 400 characters each, at 
 3. **Inspection.** The reviewer may ask for up to `inspection.max_requests` more source ranges (`InspectionRequest`), answered by the bulk-reading role. Requests must stay inside the workspace and say what they need to confirm.
 4. **Verdict.** `pass`, `needs_changes` or `blocked` (reported as the `PASS`, `NEEDS_CHANGES` and `BLOCKED` markers). `validate_verdict` accepts it only if:
    - it came from the assigned reviewer and model, and covers the packet's diff hash;
-   - a `Pass` assesses correctness, security, regressions and unresolved risks, has no finding of medium severity or higher, no evidence gaps, and no failed or missing verification;
+   - a `Pass` assesses correctness, security, regressions and unresolved risks, has no finding of medium severity or higher, no evidence gaps, and no failed, missing or contradictory verification (a `passed` result with a nonzero exit code is rejected in the packet and in the verdict);
    - `NEEDS_CHANGES` names a finding or an evidence gap;
    - `BLOCKED` says why review could not run.
 5. **Bounded repair.** `next_action` decides what follows a failure. Model unavailable and policy violation always escalate. A transient failure retries while attempts remain. A failed verification or a `NEEDS_CHANGES` review starts a repair cycle while `max_repair_cycles` remains. Otherwise `on_exhausted` applies: `escalate` (the default) asks a human, `abort` stops. No loop ends by continuing silently.
@@ -109,10 +109,10 @@ A bulk reader returns a `Handoff`: compact claims (1 to 400 characters each, at 
 - **Capabilities:** unknown tools; tools the backend does not support; tools the workflow policy does not allow; only implementation roles may edit; a read-only role cannot hold `edit`; an implementation role needs `edit`; MCP servers need the `mcp` tool.
 - **Model policies:** bulk-reading roles must use `lowest_cost`, and a capable model must exist; `strongest_review` is only for the reviewer, and a reviewer must exist; a pinned model must be in the registry and able to meet the role's requirements.
 - **Plugins:** each referenced plugin is loaded, trusted and contains the named skill or server.
-- **Ownership:** implementation stages own paths; other stages own none; paths are relative and inside the workspace; two writers that may run at the same time cannot own overlapping paths.
+- **Ownership:** implementation stages own paths; other stages own none. Paths are normalized before comparison (`.`, `./`, `src`, `src/`, `src/./module.rs`, `SRC\Module.rs` and so on). A spelling that cannot be normalized reliably (absolute, drive-qualified, `..`, trailing dot or space, `~` short names, wildcards, control characters) fails validation and is treated as overlapping everything. Two writers that may run at the same time on any path cannot own overlapping paths.
 - **Evidence:** bulk-reading stages produce evidence; implementation stages produce a diff.
 - **Review:** a workflow that changes code has exactly one review stage, in its own role and independent of implementation. It runs on every path, every other stage is one of its dependencies, it takes required `diff`, `objective`, `acceptance_criteria` and `verification` inputs from the right stages, produces a verdict, allows inspection by a bulk-reading role, and depends on every implementation stage.
-- **Per path:** on each path, a required input must come from a stage that also runs there, and every implementation stage must be verified by a verification stage on that path.
+- **Per path:** each path has its own dependency graph, built only from the stages on it. A stage never waits for a stage omitted from the path: a `depends_on` stage must run on every path its dependant runs on, or the dependant must list it under `optional_depends_on`. A required input must come from a stage that runs there and is ordered before it. Every stage is a dependency of the review, and every implementation stage is verified, on each path. Ownership conflicts are judged on each path's graph. `ValidatedWorkflow::waits_for(path, stage)` returns the resolved dependencies for one path.
 - **Enforcement:** see below. Violations appear here only when `strict_enforcement` is set.
 
 ## Enforcement

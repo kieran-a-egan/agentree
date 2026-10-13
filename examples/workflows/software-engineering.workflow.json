@@ -127,6 +127,7 @@
       "id": "explore",
       "role": "explorer",
       "depends_on": [],
+      "optional_depends_on": [],
       "min_path": "fast",
       "inputs": [
         {
@@ -153,6 +154,7 @@
       "id": "research",
       "role": "researcher",
       "depends_on": [],
+      "optional_depends_on": [],
       "min_path": "balanced",
       "inputs": [
         {
@@ -182,6 +184,7 @@
         "explore",
         "research"
       ],
+      "optional_depends_on": [],
       "min_path": "balanced",
       "inputs": [
         {
@@ -219,7 +222,9 @@
       "id": "implement",
       "role": "coder",
       "depends_on": [
-        "explore",
+        "explore"
+      ],
+      "optional_depends_on": [
         "plan"
       ],
       "min_path": "fast",
@@ -268,6 +273,7 @@
       "depends_on": [
         "implement"
       ],
+      "optional_depends_on": [],
       "min_path": "fast",
       "inputs": [
         {
@@ -300,6 +306,7 @@
         "implement",
         "test"
       ],
+      "optional_depends_on": [],
       "min_path": "balanced",
       "inputs": [
         {
@@ -340,6 +347,7 @@
         "implement",
         "test"
       ],
+      "optional_depends_on": [],
       "min_path": "thorough",
       "inputs": [
         {
@@ -370,7 +378,9 @@
       "role": "final_reviewer",
       "depends_on": [
         "implement",
-        "test",
+        "test"
+      ],
+      "optional_depends_on": [
         "prepare-review",
         "risk-scan"
       ],

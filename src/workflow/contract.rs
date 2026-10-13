@@ -238,8 +238,14 @@ pub struct Inspection {
 pub struct Stage {
     pub id: String,
     pub role: String,
+    /// Stages this one always waits for. Each must run on every path this stage runs on
+    /// (`min_path` no higher than this stage's), or validation fails.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Stages this one waits for only when they are on the chosen path. Ordering only: a
+    /// required input may not come from one, because it may be absent.
+    #[serde(default)]
+    pub optional_depends_on: Vec<String>,
     #[serde(default = "fast")]
     pub min_path: ExecutionPath,
     #[serde(default)]
@@ -368,6 +374,28 @@ impl ValidatedWorkflow {
             .collect()
     }
 
+    /// What `stage` waits for on `path`: its `depends_on` plus those `optional_depends_on`
+    /// stages that run there. Empty when `stage` is not on `path`. Every id is a stage in
+    /// [`ValidatedWorkflow::stages_for`] for the same path, so the graph is self-contained.
+    pub fn waits_for<'a>(&self, path: ExecutionPath, stage: &'a Stage) -> Vec<&'a str> {
+        if stage.min_path > path {
+            return vec![];
+        }
+        let on = |id: &str| {
+            self.def
+                .stages
+                .iter()
+                .any(|s| s.id == id && s.min_path <= path)
+        };
+        stage
+            .depends_on
+            .iter()
+            .chain(&stage.optional_depends_on)
+            .map(String::as_str)
+            .filter(|id| on(id))
+            .collect()
+    }
+
     pub fn review_stage(&self) -> Option<&Stage> {
         self.def.stages.iter().find(|s| {
             self.role(&s.role)
@@ -384,14 +412,43 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// The canonical form of an owned path: `/`-separated, lowercase (the strictest common
+/// filesystem rule), `.` and empty components dropped. `""` is the whole workspace. `None`
+/// means the spelling is ambiguous or unsafe and cannot be compared reliably: it escapes the
+/// workspace, is absolute or drive-qualified, or uses a Windows alias form (trailing dot or
+/// space, `~` short names, wildcards, control characters).
+fn normalize_owned(path: &str) -> Option<String> {
+    // A trailing separator is the same directory; a bare `/` or an empty string is not relative.
+    let path = path.trim_end_matches(['/', '\\']);
+    if !relative(path) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for c in path.split(['/', '\\']) {
+        match c {
+            "" | "." => continue,
+            ".." => return None,
+            _ => {}
+        }
+        if c.ends_with(['.', ' '])
+            || c.contains(['~', '*', '?', '"', '<', '>', '|'])
+            || c.chars().any(char::is_control)
+        {
+            return None;
+        }
+        parts.push(c.to_lowercase());
+    }
+    Some(parts.join("/"))
+}
+
+/// Whether two owned paths may touch the same file. Anything that cannot be normalized
+/// counts as overlapping, so an alias never slips past the parallel-write check.
 fn overlaps(a: &str, b: &str) -> bool {
-    let norm = |s: &str| {
-        let s = s.replace('\\', "/").to_lowercase();
-        s.trim_start_matches("./").trim_matches('/').to_string()
+    let (Some(a), Some(b)) = (normalize_owned(a), normalize_owned(b)) else {
+        return true;
     };
-    let (a, b) = (norm(a), norm(b));
-    a == "."
-        || b == "."
+    a.is_empty()
+        || b.is_empty()
         || a == b
         || b.starts_with(&format!("{a}/"))
         || a.starts_with(&format!("{b}/"))
@@ -438,6 +495,11 @@ impl WorkflowDef {
     }
 }
 
+/// Every stage `s` may wait for, required or optional.
+fn deps(s: &Stage) -> impl Iterator<Item = &String> {
+    s.depends_on.iter().chain(&s.optional_depends_on)
+}
+
 /// Kahn's algorithm over known dependencies. `Err` lists the stages stuck in or behind a cycle.
 fn topo(def: &WorkflowDef) -> Result<Vec<usize>, Vec<String>> {
     let index: BTreeMap<&str, usize> = def
@@ -449,7 +511,7 @@ fn topo(def: &WorkflowDef) -> Result<Vec<usize>, Vec<String>> {
     let mut indegree = vec![0usize; def.stages.len()];
     let mut dependents: Vec<Vec<usize>> = vec![vec![]; def.stages.len()];
     for (i, s) in def.stages.iter().enumerate() {
-        for dep in &s.depends_on {
+        for dep in deps(s) {
             if let Some(&d) = index.get(dep.as_str()) {
                 indegree[i] += 1;
                 dependents[d].push(i);
@@ -475,6 +537,35 @@ fn topo(def: &WorkflowDef) -> Result<Vec<usize>, Vec<String>> {
             .map(|i| def.stages[i].id.clone())
             .collect())
     }
+}
+
+/// One execution path's dependency graph. `anc[i]` is empty for a stage that is not `on`.
+struct PathGraph {
+    path: ExecutionPath,
+    on: Vec<bool>,
+    anc: Vec<BTreeSet<usize>>,
+}
+
+/// Transitive dependencies of each stage in `on`, following only edges whose ends are both in
+/// `on`. An omitted stage therefore passes nothing on: a chain through it is broken.
+fn ancestors(
+    def: &WorkflowDef,
+    index: &BTreeMap<&str, usize>,
+    order: &[usize],
+    on: &[bool],
+) -> Vec<BTreeSet<usize>> {
+    let mut anc: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); def.stages.len()];
+    for &i in order.iter().filter(|&&i| on[i]) {
+        let mut set = BTreeSet::new();
+        for d in deps(&def.stages[i]) {
+            if let Some(&di) = index.get(d.as_str()).filter(|&&di| on[di]) {
+                set.insert(di);
+                set.extend(anc[di].iter().copied());
+            }
+        }
+        anc[i] = set;
+    }
+    anc
 }
 
 fn check(
@@ -518,7 +609,8 @@ fn check(
                 format!("role '{}' is not defined", s.role),
             ));
         }
-        for d in &s.depends_on {
+        let mut waits = BTreeSet::new();
+        for d in deps(s) {
             if d == &s.id {
                 out.push(Violation::new(Code::Cycle, &at, "depends on itself"));
             } else if !def.stages.iter().any(|o| &o.id == d) {
@@ -526,6 +618,13 @@ fn check(
                     Code::Unknown,
                     &at,
                     format!("depends on unknown stage '{d}'"),
+                ));
+            } else if !waits.insert(d.as_str()) {
+                // Listed twice, or both required and optional: the contract must say which.
+                out.push(Violation::new(
+                    Code::Duplicate,
+                    &at,
+                    format!("'{d}' is listed more than once in its dependencies"),
                 ));
             }
         }
@@ -565,29 +664,32 @@ fn check(
             return None;
         }
     };
-    // Transitive dependencies of each stage, by index.
     let index: BTreeMap<&str, usize> = def
         .stages
         .iter()
         .enumerate()
         .map(|(i, s)| (s.id.as_str(), i))
         .collect();
-    let mut anc: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); def.stages.len()];
-    for &i in &order {
-        let mut set = BTreeSet::new();
-        for d in &def.stages[i].depends_on {
-            if let Some(&di) = index.get(d.as_str()) {
-                set.insert(di);
-                set.extend(anc[di].iter().copied());
+    // Transitive dependencies of each stage over the whole graph, by index.
+    let all = vec![true; def.stages.len()];
+    let anc = ancestors(def, &index, &order, &all);
+    // The same, once per execution path: only stages on the path, and only edges between them.
+    let graphs: Vec<PathGraph> = PATHS
+        .iter()
+        .map(|&path| {
+            let on: Vec<bool> = def.stages.iter().map(|s| s.min_path <= path).collect();
+            PathGraph {
+                path,
+                anc: ancestors(def, &index, &order, &on),
+                on,
             }
-        }
-        anc[i] = set;
-    }
+        })
+        .collect();
 
     check_data_flow(def, &roles, &index, &anc, out);
-    check_ownership(def, &roles, &anc, out);
-    check_review(def, &roles, &index, &anc, out);
-    check_paths(def, &roles, &index, &anc, out);
+    check_ownership(def, &roles, &graphs, out);
+    check_review(def, &roles, &index, &graphs, out);
+    check_paths(def, &roles, &index, &graphs, out);
     check_enforcement(def, ctx, limitations, out);
     Some(order)
 }
@@ -868,7 +970,7 @@ fn check_data_flow(
 fn check_ownership(
     def: &WorkflowDef,
     roles: &BTreeMap<&str, &RoleDef>,
-    anc: &[BTreeSet<usize>],
+    graphs: &[PathGraph],
     out: &mut Vec<Violation>,
 ) {
     let imp: Vec<usize> = def
@@ -898,32 +1000,38 @@ fn check_ownership(
             ));
         }
         for p in &s.owns {
-            if !relative(p) {
+            if normalize_owned(p).is_none() {
                 out.push(Violation::new(
                     Code::Ownership,
                     &at,
-                    format!("'{p}' is not a relative path inside the workspace"),
+                    format!("'{p}' is ambiguous or not a plain relative path inside the workspace"),
                 ));
             }
         }
     }
-    // Two writers that may run at the same time cannot own overlapping paths.
-    for (n, &a) in imp.iter().enumerate() {
-        for &b in &imp[n + 1..] {
-            if anc[a].contains(&b) || anc[b].contains(&a) {
-                continue;
-            }
-            for pa in &def.stages[a].owns {
-                for pb in &def.stages[b].owns {
-                    if overlaps(pa, pb) {
-                        out.push(Violation::new(
-                            Code::Ownership,
-                            format!("stages[{}]", def.stages[a].id),
-                            format!(
-                                "may run alongside '{}' but both own '{pa}'/'{pb}'",
-                                def.stages[b].id
-                            ),
-                        ));
+    // Two writers that may run at the same time cannot own overlapping paths. "May run at the
+    // same time" is decided per path: an optional stage that is omitted orders nothing.
+    let mut reported = BTreeSet::new();
+    for g in graphs {
+        for (n, &a) in imp.iter().enumerate().filter(|(_, &a)| g.on[a]) {
+            for &b in imp[n + 1..].iter().filter(|&&b| g.on[b]) {
+                if g.anc[a].contains(&b) || g.anc[b].contains(&a) {
+                    continue;
+                }
+                for pa in &def.stages[a].owns {
+                    for pb in &def.stages[b].owns {
+                        if overlaps(pa, pb) && reported.insert((a, b, pa, pb)) {
+                            out.push(Violation::new(
+                                Code::Ownership,
+                                format!("stages[{}]", def.stages[a].id),
+                                format!(
+                                    "may run alongside '{}' on the {} path but both own \
+                                     '{pa}'/'{pb}'",
+                                    def.stages[b].id,
+                                    g.path.label()
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -935,7 +1043,7 @@ fn check_review(
     def: &WorkflowDef,
     roles: &BTreeMap<&str, &RoleDef>,
     index: &BTreeMap<&str, usize>,
-    anc: &[BTreeSet<usize>],
+    graphs: &[PathGraph],
     out: &mut Vec<Violation>,
 ) {
     let class_of = |s: &Stage| roles.get(s.role.as_str()).map(|r| r.class);
@@ -969,17 +1077,23 @@ fn check_review(
             "final review is mandatory on every path; min_path must be 'fast'",
         ));
     }
-    // The review is last: everything else is one of its dependencies.
-    for i in 0..def.stages.len() {
-        if i != r && !anc[r].contains(&i) {
-            out.push(Violation::new(
-                Code::Review,
-                &at,
-                format!(
-                    "stage '{}' is not a dependency of the final review, so it could run after it",
-                    def.stages[i].id
-                ),
-            ));
+    // The review is last on every path: every other stage on the path is one of its
+    // dependencies there. A link through an omitted optional stage does not count.
+    let mut late = BTreeSet::new();
+    for g in graphs.iter().filter(|g| g.on[r]) {
+        for i in (0..def.stages.len()).filter(|&i| i != r && g.on[i]) {
+            if !g.anc[r].contains(&i) && late.insert(i) {
+                out.push(Violation::new(
+                    Code::Review,
+                    &at,
+                    format!(
+                        "stage '{}' is not a dependency of the final review on the {} path, \
+                         so it could run after it",
+                        def.stages[i].id,
+                        g.path.label()
+                    ),
+                ));
+            }
         }
     }
     if rs.outputs.iter().all(|o| o.kind != ArtifactKind::Verdict) {
@@ -1036,61 +1150,84 @@ fn check_review(
             ),
         )),
     }
-    for &i in &imps {
-        if !anc[r].contains(&i) {
-            out.push(Violation::new(
-                Code::Review,
-                &at,
-                format!("implementation '{}' is not reviewed", def.stages[i].id),
-            ));
-        }
+    for &i in imps.iter().filter(|i| late.contains(i)) {
+        out.push(Violation::new(
+            Code::Review,
+            &at,
+            format!("implementation '{}' is not reviewed", def.stages[i].id),
+        ));
     }
 }
 
-/// Every execution path must stand on its own: whatever a stage requires must be on the path,
-/// and code changes are always verified before review.
+/// Every execution path must stand on its own: a stage on the path never waits for a stage
+/// that is not on it, whatever it requires is on the path and ordered before it, and code
+/// changes are always verified before review.
 fn check_paths(
     def: &WorkflowDef,
     roles: &BTreeMap<&str, &RoleDef>,
     index: &BTreeMap<&str, usize>,
-    anc: &[BTreeSet<usize>],
+    graphs: &[PathGraph],
     out: &mut Vec<Violation>,
 ) {
     let class_of = |s: &Stage| roles.get(s.role.as_str()).map(|r| r.class);
-    for path in PATHS {
-        let on: Vec<usize> = (0..def.stages.len())
-            .filter(|&i| def.stages[i].min_path <= path)
-            .collect();
-        for &i in &on {
-            for input in def.stages[i].inputs.iter().filter(|i| i.required) {
-                if let Some(&f) = input
-                    .from
-                    .as_ref()
-                    .and_then(|f| index.get(f.stage.as_str()))
-                {
-                    if !on.contains(&f) {
+    let mut waits_off_path = BTreeSet::new();
+    for g in graphs {
+        let on = |i: usize| g.on[i];
+        for i in (0..def.stages.len()).filter(|&i| on(i)) {
+            let at = format!("stages[{}]", def.stages[i].id);
+            // A required dependency that is omitted from this path would block it forever.
+            for d in &def.stages[i].depends_on {
+                if let Some(&f) = index.get(d.as_str()).filter(|&&f| !on(f)) {
+                    if waits_off_path.insert((i, f)) {
                         out.push(Violation::new(
                             Code::Schema,
-                            format!("stages[{}]", def.stages[i].id),
+                            &at,
                             format!(
-                                "on the {} path it requires '{}' from '{}', which does not run there",
-                                path.label(),
-                                input.name,
-                                def.stages[f].id
+                                "depends_on '{d}', which does not run on the {} path; make it \
+                                 optional_depends_on or raise this stage's min_path",
+                                g.path.label()
                             ),
                         ));
                     }
                 }
             }
+            for input in def.stages[i].inputs.iter().filter(|i| i.required) {
+                let Some(&f) = input
+                    .from
+                    .as_ref()
+                    .and_then(|f| index.get(f.stage.as_str()))
+                else {
+                    continue;
+                };
+                let problem = if !on(f) {
+                    "which does not run there"
+                } else if !g.anc[i].contains(&f) {
+                    "which is not ordered before it there"
+                } else {
+                    continue;
+                };
+                out.push(Violation::new(
+                    Code::Schema,
+                    &at,
+                    format!(
+                        "on the {} path it requires '{}' from '{}', {problem}",
+                        g.path.label(),
+                        input.name,
+                        def.stages[f].id
+                    ),
+                ));
+            }
             if class_of(&def.stages[i]) == Some(RoleClass::Implementation) {
-                let verified = on.iter().any(|&v| {
-                    class_of(&def.stages[v]) == Some(RoleClass::Verification) && anc[v].contains(&i)
+                let verified = (0..def.stages.len()).any(|v| {
+                    on(v)
+                        && class_of(&def.stages[v]) == Some(RoleClass::Verification)
+                        && g.anc[v].contains(&i)
                 });
                 if !verified {
                     out.push(Violation::new(
                         Code::Review,
-                        format!("stages[{}]", def.stages[i].id),
-                        format!("is not verified on the {} path", path.label()),
+                        &at,
+                        format!("is not verified on the {} path", g.path.label()),
                     ));
                 }
             }
@@ -1236,6 +1373,7 @@ pub fn default_workflow(with_skills: bool) -> WorkflowDef {
         id: id.into(),
         role: role.into(),
         depends_on: deps(depends),
+        optional_depends_on: vec![],
         min_path,
         inputs,
         outputs,
@@ -1248,7 +1386,7 @@ pub fn default_workflow(with_skills: bool) -> WorkflowDef {
     let mut implement = stage(
         "implement",
         "coder",
-        &["explore", "plan"],
+        &["explore"],
         Fast,
         vec![
             input("evidence", from("explore", "evidence"), true),
@@ -1257,11 +1395,13 @@ pub fn default_workflow(with_skills: bool) -> WorkflowDef {
         ],
         vec![out("diff", Diff)],
     );
+    // `plan` runs from Balanced up; on Fast the implementer starts without waiting for it.
+    implement.optional_depends_on = deps(&["plan"]);
     implement.owns = vec![".".into()];
     let mut review = stage(
         "review",
         "final_reviewer",
-        &["implement", "test", "prepare-review", "risk-scan"],
+        &["implement", "test"],
         Fast,
         vec![
             input("diff", from("implement", "diff"), true),
@@ -1273,6 +1413,8 @@ pub fn default_workflow(with_skills: bool) -> WorkflowDef {
         ],
         vec![out("verdict", Verdict)],
     );
+    // Extra evidence exists only on the paths that run its stage; review waits only for those.
+    review.optional_depends_on = deps(&["prepare-review", "risk-scan"]);
     review.inspection = Some(Inspection {
         max_requests: 5,
         reader_role: "explorer".into(),
@@ -1476,6 +1618,106 @@ mod tests {
         }
     }
 
+    fn stage<'a>(d: &'a mut WorkflowDef, id: &str) -> &'a mut Stage {
+        d.stages.iter_mut().find(|s| s.id == id).unwrap()
+    }
+
+    #[test]
+    fn every_path_is_a_self_contained_dependency_graph() {
+        let ok = validate(default_workflow(true)).unwrap();
+        for p in PATHS {
+            let ids: Vec<&str> = ok.stages_for(p).iter().map(|s| s.id.as_str()).collect();
+            for (n, s) in ok.stages_for(p).into_iter().enumerate() {
+                for w in ok.waits_for(p, s) {
+                    // Waits only for stages on this path, and those are scheduled earlier.
+                    assert!(
+                        ids[..n].contains(&w),
+                        "{p:?}: '{}' waits for '{w}' which is not before it",
+                        s.id
+                    );
+                }
+            }
+        }
+        let waits = |p, id: &str| {
+            let s = ok.def().stages.iter().find(|s| s.id == id).unwrap();
+            ok.waits_for(p, s)
+        };
+        // `plan` and the extra evidence exist only on higher paths.
+        assert_eq!(waits(ExecutionPath::Fast, "implement"), ["explore"]);
+        assert_eq!(
+            waits(ExecutionPath::Balanced, "implement"),
+            ["explore", "plan"]
+        );
+        assert_eq!(waits(ExecutionPath::Fast, "review"), ["implement", "test"]);
+        assert_eq!(
+            waits(ExecutionPath::Balanced, "review"),
+            ["implement", "test", "prepare-review"]
+        );
+        assert_eq!(
+            waits(ExecutionPath::Thorough, "review"),
+            ["implement", "test", "prepare-review", "risk-scan"]
+        );
+        // A stage that is not on the path waits for nothing.
+        assert!(waits(ExecutionPath::Fast, "plan").is_empty());
+    }
+
+    #[test]
+    fn a_required_dependency_that_only_a_higher_path_runs_is_rejected() {
+        // The old shape: the Fast implementer waits for the Balanced-only planner.
+        let mut d = default_workflow(false);
+        stage(&mut d, "implement").depends_on.push("plan".into());
+        stage(&mut d, "implement").optional_depends_on.clear();
+        let v = validate(d).unwrap_err();
+        assert!(v.iter().any(|v| v.code == Code::Schema
+            && v.at == "stages[implement]"
+            && v.message.contains("Fast")));
+        // Same for the review waiting on an extra evidence stage.
+        let mut d = default_workflow(false);
+        let rv = stage(&mut d, "review");
+        rv.depends_on.push("risk-scan".into());
+        rv.optional_depends_on.retain(|s| s != "risk-scan");
+        assert!(codes(validate(d)).contains(&Code::Schema));
+        // A required *input* from a higher-path stage is rejected even when it is ordered.
+        let mut d = default_workflow(false);
+        stage(&mut d, "review")
+            .inputs
+            .iter_mut()
+            .find(|i| i.name == "risks")
+            .unwrap()
+            .required = true;
+        assert!(codes(validate(d)).contains(&Code::Schema));
+        // Optional ordering is the supported way to depend on a higher-path stage.
+        assert!(validate(default_workflow(false)).is_ok());
+    }
+
+    #[test]
+    fn optional_dependencies_are_unambiguous_and_still_ordered() {
+        // Listing a stage as both required and optional is ambiguous.
+        let mut d = default_workflow(false);
+        stage(&mut d, "review")
+            .optional_depends_on
+            .push("implement".into());
+        assert!(codes(validate(d)).contains(&Code::Duplicate));
+        // Optional edges take part in cycle detection.
+        let mut d = default_workflow(false);
+        stage(&mut d, "explore").optional_depends_on = vec!["review".into()];
+        assert!(codes(validate(d)).contains(&Code::Cycle));
+        // And in reference checks.
+        let mut d = default_workflow(false);
+        stage(&mut d, "review").optional_depends_on = vec!["ghost".into()];
+        assert!(codes(validate(d)).contains(&Code::Unknown));
+        // A stage on a path that is not reachable from review there is flagged, per path:
+        // dropping the optional edge makes `risk-scan` unordered with the review on Thorough.
+        let mut d = default_workflow(false);
+        stage(&mut d, "review")
+            .optional_depends_on
+            .retain(|s| s != "risk-scan");
+        let v = validate(d).unwrap_err();
+        assert!(v
+            .iter()
+            .any(|v| v.code == Code::Review && v.message.contains("Thorough")));
+    }
+
     #[test]
     fn dependency_cycles_are_rejected() {
         let mut d = default_workflow(false);
@@ -1605,6 +1847,139 @@ mod tests {
             .depends_on
             .push("implement-b".into());
         assert!(codes(validate(d)).contains(&Code::Ownership));
+    }
+
+    #[test]
+    fn equivalent_paths_normalize_the_same_and_aliases_overlap() {
+        let root = ["."];
+        let same_as_root = [".", "./", ".\\", "", "./."];
+        // Whole workspace overlaps everything, in any spelling.
+        for r in root.iter().chain(&same_as_root[..3]) {
+            for p in ["src", "src/", "./src", "src/./module.rs", "SRC\\Module.rs"] {
+                assert!(overlaps(r, p), "{r:?} vs {p:?}");
+                assert!(overlaps(p, r), "{p:?} vs {r:?}");
+            }
+        }
+        assert_eq!(normalize_owned("./"), Some(String::new()));
+        for (a, b) in [
+            ("src", "src/"),
+            ("src", "./src"),
+            ("src", "SRC"),
+            ("src", "src\\"),
+            ("src/./module.rs", "src/module.rs"),
+            ("src/module.rs", "SRC\\Module.rs"),
+            ("src", "src/./module.rs"),
+            ("src/a", "src\\a\\b\\c.rs"),
+            ("src//a", "src/a"),
+            ("./src/.", "src"),
+        ] {
+            assert!(overlaps(a, b) && overlaps(b, a), "{a:?} vs {b:?}");
+        }
+        // Distinct siblings and look-alike prefixes do not overlap.
+        for (a, b) in [
+            ("src", "srcs"),
+            ("src/a", "src/b"),
+            ("src/a.rs", "src/a"),
+            ("docs", "src/docs"),
+        ] {
+            assert!(!overlaps(a, b), "{a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_ownership_spellings_fail_validation_and_always_overlap() {
+        for bad in [
+            "/src",
+            "\\src",
+            "C:\\src",
+            "C:src",
+            "../src",
+            "src/../other",
+            "src.",
+            "src /a",
+            "src ",
+            "PROGRA~1",
+            "src/*.rs",
+            "a\u{0}b",
+            "",
+            "  ",
+        ] {
+            assert_eq!(normalize_owned(bad), None, "{bad:?}");
+            assert!(overlaps(bad, "docs"), "{bad:?} must not bypass the check");
+            let mut d = default_workflow(false);
+            stage(&mut d, "implement").owns = vec![bad.into()];
+            let v = validate(d).unwrap_err();
+            assert!(
+                v.iter().any(|v| v.code == Code::Ownership),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// A second implementer that is unordered with `implement`, owning `path`.
+    fn with_parallel_writer(path: &str, ordered: bool) -> WorkflowDef {
+        let mut d = default_workflow(false);
+        let mut second = stage(&mut d, "implement").clone();
+        second.id = "implement-b".into();
+        second.owns = vec![path.into()];
+        if ordered {
+            second.depends_on.push("implement".into());
+        }
+        d.stages.push(second);
+        let rv = stage(&mut d, "review");
+        rv.depends_on.push("implement-b".into());
+        // Keep verification out of the picture: the new stage is tested by `test` too.
+        stage(&mut d, "test").depends_on.push("implement-b".into());
+        d
+    }
+
+    #[test]
+    fn path_aliases_cannot_bypass_the_parallel_write_check() {
+        // `implement` owns the whole workspace; every spelling below is a part of it.
+        for alias in ["src", "./src/", "SRC\\module.rs", "src/./module.rs", "."] {
+            let c = codes(validate(with_parallel_writer(alias, false)));
+            assert!(c.contains(&Code::Ownership), "{alias:?} slipped through");
+            // Ordering the writers removes the conflict.
+            assert!(
+                validate(with_parallel_writer(alias, true)).is_ok(),
+                "{alias:?}"
+            );
+        }
+        // Disjoint ownership of parallel writers is fine, whatever the separator or case.
+        let mut d = with_parallel_writer("Tests\\unit", false);
+        stage(&mut d, "implement").owns = vec!["./src/".into()];
+        assert!(validate(d).is_ok());
+        let mut d = with_parallel_writer("SRC\\module.rs", false);
+        stage(&mut d, "implement").owns = vec!["src/./MODULE.rs".into()];
+        assert!(codes(validate(d)).contains(&Code::Ownership));
+    }
+
+    #[test]
+    fn parallel_writers_are_judged_on_each_path() {
+        // On Balanced, `late` follows `implement`, and `early` follows `late`. Fast omits
+        // `late`, which is the only thing ordering `early` after `implement`.
+        let mut d = default_workflow(false);
+        let mut early = stage(&mut d, "implement").clone();
+        early.id = "early".into();
+        early.owns = vec!["SRC\\".into()];
+        early.optional_depends_on = vec!["late".into()];
+        let mut late = early.clone();
+        late.id = "late".into();
+        late.min_path = ExecutionPath::Balanced;
+        late.depends_on = vec!["implement".into()];
+        late.optional_depends_on.clear();
+        d.stages.push(early);
+        d.stages.push(late);
+        let rv = stage(&mut d, "review");
+        rv.depends_on.push("early".into());
+        rv.optional_depends_on.push("late".into());
+        let t = stage(&mut d, "test");
+        t.depends_on.push("early".into());
+        t.optional_depends_on.push("late".into());
+        let v = validate(d).unwrap_err();
+        let own: Vec<_> = v.iter().filter(|v| v.code == Code::Ownership).collect();
+        assert!(own.iter().any(|v| v.message.contains("Fast")), "{v:?}");
+        assert!(own.iter().all(|v| !v.message.contains("Balanced")), "{v:?}");
     }
 
     #[test]

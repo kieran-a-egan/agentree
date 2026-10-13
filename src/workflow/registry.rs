@@ -77,8 +77,10 @@ pub struct Registry {
     #[serde(default = "current_version")]
     pub version: u32,
     pub models: Vec<ModelEntry>,
-    /// Explicit final-review order, strongest first. When non-empty it is also an allowlist:
-    /// a model not listed is never a reviewer. When empty, `intelligence` ranks the reviewers.
+    /// Final-review tie-break order, strongest first. It can only order models of equal
+    /// `intelligence`; it never promotes a weaker model over a stronger one, and a list that
+    /// tries to is rejected by [`Registry::validate`]. Restrict who may review with tools,
+    /// `max_permission` and `data_classes`, which selection always honours.
     #[serde(default)]
     pub review_priority: Vec<String>,
 }
@@ -206,30 +208,54 @@ impl Registry {
                 }
             }
         }
-        for name in &self.review_priority {
-            if self.get(name).is_none() {
+        for (i, name) in self.review_priority.iter().enumerate() {
+            let Some(listed) = self.get(name) else {
                 out.push(Violation::new(
                     Code::Registry,
                     "review_priority",
                     format!("'{name}' is not in the registry"),
                 ));
+                continue;
+            };
+            // A stronger model that is unlisted or listed later would be silently outranked.
+            for m in self
+                .models
+                .iter()
+                .filter(|m| m.intelligence > listed.intelligence)
+            {
+                if !self.review_priority[..i].iter().any(|n| m.matches(n)) {
+                    out.push(Violation::new(
+                        Code::Registry,
+                        "review_priority",
+                        format!(
+                            "'{name}' would outrank the stronger model '{}'; review order \
+                             follows intelligence and the list may only order equals",
+                            m.id
+                        ),
+                    ));
+                }
             }
         }
         out
     }
 
-    /// Reviewer candidates, strongest first.
+    /// Reviewer candidates, strongest first. Intelligence always decides; `review_priority`
+    /// only orders models of equal intelligence, then the id.
     fn review_order(&self) -> Vec<&ModelEntry> {
-        if self.review_priority.is_empty() {
-            let mut all: Vec<_> = self.models.iter().collect();
-            all.sort_by(|a, b| b.intelligence.cmp(&a.intelligence).then(a.id.cmp(&b.id)));
-            all
-        } else {
+        let rank = |m: &ModelEntry| {
             self.review_priority
                 .iter()
-                .filter_map(|n| self.get(n))
-                .collect()
-        }
+                .position(|n| m.matches(n))
+                .unwrap_or(usize::MAX)
+        };
+        let mut all: Vec<_> = self.models.iter().collect();
+        all.sort_by(|a, b| {
+            b.intelligence
+                .cmp(&a.intelligence)
+                .then(rank(a).cmp(&rank(b)))
+                .then(a.id.cmp(&b.id))
+        });
+        all
     }
 
     /// Whether any configured model could ever run bulk work with this requirement, ignoring
@@ -365,42 +391,47 @@ impl Registry {
         })
     }
 
-    /// The final reviewer is the strongest *eligible* configured model. If it is unavailable
-    /// the outcome is an escalation: there is no automatic fallback to a weaker model.
+    /// The final reviewer is the strongest *eligible* configured model: capable, large enough,
+    /// highest `intelligence`. Equally strong models are interchangeable, so an available one
+    /// is used. If none of the strongest tier is available the outcome is an escalation: a
+    /// weaker model runs only on an explicit `Authorization`.
     pub fn select_review(
         &self,
         req: &Requirement,
         auth: Option<&Authorization>,
     ) -> Result<ReviewSelection, Escalation> {
-        let order = self.review_order();
-        let eligible: Vec<&ModelEntry> = order
+        let eligible: Vec<&ModelEntry> = self
+            .review_order()
             .into_iter()
             .filter(|m| m.capable(req) && m.fits(req))
             .collect();
-        let Some(strongest) = eligible.first() else {
+        let Some(top) = eligible.first() else {
             return Err(Escalation {
                 kind: EscalationKind::NoCapableModel,
                 message: "No configured model can perform the independent final review.".into(),
                 options: vec![],
             });
         };
-        if strongest.available {
+        let level = top.intelligence;
+        if let Some(m) = eligible
+            .iter()
+            .find(|m| m.intelligence == level && m.available)
+        {
             return Ok(ReviewSelection {
-                model: strongest.id.clone(),
-                strongest: strongest.id.clone(),
+                model: m.id.clone(),
+                strongest: m.id.clone(),
                 authorized_downgrade: false,
             });
         }
         let fallbacks: Vec<&ModelEntry> = eligible
             .iter()
-            .skip(1)
             .copied()
-            .filter(|m| m.available)
+            .filter(|m| m.intelligence < level && m.available)
             .collect();
         if let Some(m) = auth.and_then(|a| fallbacks.iter().find(|m| m.matches(&a.model))) {
             return Ok(ReviewSelection {
                 model: m.id.clone(),
-                strongest: strongest.id.clone(),
+                strongest: top.id.clone(),
                 authorized_downgrade: true,
             });
         }
@@ -409,7 +440,7 @@ impl Registry {
             message: format!(
                 "The strongest eligible reviewer '{}' is unavailable. Final review is blocked \
                  until you authorize a named weaker reviewer or the model returns.",
-                strongest.id
+                top.id
             ),
             options: fallbacks.iter().map(|m| m.id.clone()).collect(),
         })
@@ -612,15 +643,84 @@ mod tests {
     }
 
     #[test]
-    fn review_priority_overrides_intelligence_and_is_an_allowlist() {
+    fn review_priority_can_never_make_a_weaker_model_the_reviewer() {
+        let mut reg = registry();
+        // Conflicting priorities: each tries to put a weaker model first or drop the strongest.
+        for conflict in [
+            vec!["mid"],
+            vec!["cheap", "top"],
+            vec!["mid", "top", "cheap"],
+        ] {
+            reg.review_priority = conflict.into_iter().map(String::from).collect();
+            assert_eq!(reg.select_review(&req(1), None).unwrap().model, "top");
+            assert!(
+                reg.validate().iter().any(|v| v.code == Code::Registry),
+                "{:?} was accepted",
+                reg.review_priority
+            );
+        }
+        reg.review_priority = vec!["top".into(), "mid".into(), "cheap".into()];
+        assert!(reg.validate().is_empty());
+        assert_eq!(reg.select_review(&req(1), None).unwrap().model, "top");
+    }
+
+    #[test]
+    fn a_conflicting_priority_does_not_turn_unavailability_into_a_silent_downgrade() {
         let mut reg = registry();
         reg.review_priority = vec!["mid".into()];
-        assert_eq!(reg.select_review(&req(1), None).unwrap().model, "mid");
-        reg.set_available("mid", false);
+        reg.set_available("top", false);
+        // "mid" is listed and available, but the strongest eligible model is "top".
         let err = reg.select_review(&req(1), None).unwrap_err();
-        // "top" is stronger but not on the allowlist, so it is not even offered.
         assert_eq!(err.kind, EscalationKind::NeedsAuthorization);
-        assert!(err.options.is_empty());
+        assert!(err.message.contains("top"));
+        assert_eq!(err.options, vec!["mid".to_string(), "cheap".to_string()]);
+        let sel = reg
+            .select_review(
+                &req(1),
+                Some(&Authorization {
+                    model: "mid".into(),
+                }),
+            )
+            .unwrap();
+        assert!(sel.authorized_downgrade);
+        assert_eq!(sel.strongest, "top");
+    }
+
+    #[test]
+    fn priority_orders_equally_strong_reviewers_and_availability_picks_among_them() {
+        let mut reg = registry();
+        reg.models.push(entry("top2", 3, 7, 200_000));
+        reg.review_priority = vec!["top2".into(), "top".into()];
+        assert!(reg.validate().is_empty());
+        assert_eq!(reg.select_review(&req(1), None).unwrap().model, "top2");
+        // An equally strong model is not a downgrade: no authorization is needed.
+        reg.set_available("top2", false);
+        let sel = reg.select_review(&req(1), None).unwrap();
+        assert_eq!(
+            (sel.model.as_str(), sel.authorized_downgrade),
+            ("top", false)
+        );
+        // Once the whole strongest tier is gone, a weaker model needs a human.
+        reg.set_available("top", false);
+        assert_eq!(
+            reg.select_review(&req(1), None).unwrap_err().kind,
+            EscalationKind::NeedsAuthorization
+        );
+    }
+
+    #[test]
+    fn capability_and_data_restrictions_still_exclude_a_stronger_reviewer() {
+        let mut reg = registry();
+        reg.models[2].data_classes.clear();
+        let sel = reg.select_review(&req(1), None).unwrap();
+        assert_eq!(
+            (sel.model.as_str(), sel.authorized_downgrade),
+            ("mid", false)
+        );
+        // Context size is eligibility too: "top" cannot hold this input, "mid" can.
+        let mut reg = registry();
+        reg.models[2].context_tokens = 1_000;
+        assert_eq!(reg.select_review(&req(50_000), None).unwrap().model, "mid");
     }
 
     #[test]
