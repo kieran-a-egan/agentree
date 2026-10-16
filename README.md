@@ -173,6 +173,16 @@ agentree --plugin C:\path\to\plugin --plugin-revoke  # withdraw trust
 
 Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). A built-in `plugins/software-engineering` plugin provides plan, explore, research, implement, test, advise and review skills, one per role. Plugins are not yet used by a run; the Claude adapter arrives later in v0.6.
 
+### Project instructions
+
+Agentree reads `AGENTS.md` and `CLAUDE.md` from the project folder and never rewrites either. Whether Claude Code loads `AGENTS.md` itself depends on its build and your settings, so Agentree reports how it reaches Claude as *imported* (a `CLAUDE.md` `@import`), *natively configured* (your user or managed settings, not verified), *requested* (the lead prompt asks for it) or *unverified*. It adds nothing where your settings drop project instructions, a `claudeMdExcludes` pattern matches `AGENTS.md`, or a `CLAUDE.md` import reaches it (import syntax only; delivery is not confirmed), and elsewhere asks only conditionally ("if not already loaded"). Files over 256 KiB or import chains over the search limits are reported as unverified. Precedence between the files is never enforced: where both exist the lead is only asked to prefer `CLAUDE.md`. A file whose real location is outside the project (symlink or junction) is reported and never read.
+
+```powershell
+agentree --instructions C:\path\to\project   # which files apply, how AGENTS.md is loaded, and how sure that is
+```
+
+See [Project instructions](docs/INSTRUCTIONS.md).
+
 ### Workflow contracts
 
 Role and workflow definitions (`agentree.workflow/1`) describe which roles exist, which models they must use, how work is routed across Fast, Balanced and Thorough paths, and when final review is mandatory. Definitions are validated before anything could run. See [Workflow contracts](docs/WORKFLOWS.md). These contracts are not yet used by a launch; the Claude adapter arrives later in v0.6.
