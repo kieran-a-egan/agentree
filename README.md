@@ -175,10 +175,10 @@ Trust is stored per folder in your user data folder and is dropped when any file
 
 ### Project instructions
 
-Agentree reads `AGENTS.md` and `CLAUDE.md` from the project folder and never rewrites either. Claude Code loads `CLAUDE.md` itself, so when `AGENTS.md` exists the lead is told to read it too (and the launch status bar says so when it matters), and `CLAUDE.md` wins where they differ.
+Agentree reads `AGENTS.md` and `CLAUDE.md` from the project folder and never rewrites either. Whether Claude Code loads `AGENTS.md` itself depends on its build and your settings, so Agentree reports how it reaches Claude as *imported* (a `CLAUDE.md` `@import`), *natively configured* (your user or managed settings, not verified), *requested* (the lead prompt asks for it) or *unverified*. It adds nothing where your settings drop project instructions, a `claudeMdExcludes` pattern matches `AGENTS.md`, or a `CLAUDE.md` import reaches it (import syntax only; delivery is not confirmed), and elsewhere asks only conditionally ("if not already loaded"). Files over 256 KiB or import chains over the search limits are reported as unverified. Precedence between the files is never enforced: where both exist the lead is only asked to prefer `CLAUDE.md`. A file whose real location is outside the project (symlink or junction) is reported and never read.
 
 ```powershell
-agentree --instructions C:\path\to\project   # which files apply, and why any conflict exists
+agentree --instructions C:\path\to\project   # which files apply, how AGENTS.md is loaded, and how sure that is
 ```
 
 See [Project instructions](docs/INSTRUCTIONS.md).

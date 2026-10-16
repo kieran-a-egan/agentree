@@ -688,16 +688,21 @@ impl App {
         let plan = self.role_settings.plan();
         let policy_file = self.run_dir.join("instructions.txt");
         let mut policy = prompt::system_policy(&self.attention_file, &self.session_id, &plan);
-        let resolved = instructions::resolve(&project);
-        if let Some(note) = resolved.lead_note() {
+        // A resolver error must not block the launch: no note, and the reason is recorded.
+        let (note, provenance, status) = match instructions::resolve(&project) {
+            Ok(r) => (r.lead_note(), r.render(), r.status_line()),
+            Err(e) => (
+                None,
+                format!("Project instructions could not be resolved: {e}\n"),
+                Some(format!("Instructions: could not be resolved ({e})")),
+            ),
+        };
+        if let Some(note) = note {
             policy.push_str("\n\n");
             policy.push_str(&note);
         }
         // Provenance for this run, next to the policy it produced.
-        fs::write(
-            self.run_dir.join("instructions-resolved.txt"),
-            resolved.render(),
-        )?;
+        fs::write(self.run_dir.join("instructions-resolved.txt"), provenance)?;
         fs::write(&policy_file, policy)?;
         let initial = prompt::initial_objective(&self.objective, &plan);
         self.terminal_expanded = false;
@@ -725,7 +730,7 @@ impl App {
                 "Claude process launched. Waiting for terminal startup | {}",
                 self.session_id
             );
-            if let Some(line) = resolved.status_line() {
+            if let Some(line) = status {
                 self.message.push_str(&format!(" | {line}"));
             }
         } else {
@@ -1461,7 +1466,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(dir) = &args.instructions {
-        print!("{}", instructions::resolve(dir).render());
+        print!(
+            "{}",
+            instructions::resolve(dir)
+                .map_err(anyhow::Error::msg)?
+                .render()
+        );
         return Ok(());
     }
     dashboard(args)
