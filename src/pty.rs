@@ -87,7 +87,7 @@ impl Drop for Session {
 
 // Exactly one native lead CLI is launched; teammates are created by Claude's
 // named Agent tool inside that interactive session, not by separate PTYs.
-fn claude_team_env(plan: &RolePlan) -> Vec<(&'static str, String)> {
+pub(crate) fn claude_team_env(plan: &RolePlan) -> Vec<(&'static str, String)> {
     let mut env = Vec::new();
     if plan.native_teams {
         env.push(("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1".to_string()));

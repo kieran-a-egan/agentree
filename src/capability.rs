@@ -19,7 +19,7 @@ use std::{
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Values accepted by `--advisor`. The CLI takes a model alias here, not a full model name.
-const ADVISORS: [&str; 1] = ["opus"];
+pub(crate) const ADVISORS: [&str; 1] = ["opus"];
 
 /// Flags probed in the CLI, as (capability label, flag). Each one takes a value.
 /// A value-less probe is safe only for flags that fail with "argument missing"; all of these were checked on Claude Code 2.1.296.

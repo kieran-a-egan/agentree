@@ -171,7 +171,7 @@ agentree --plugin C:\path\to\plugin --plugin-trust   # trust it as it is now
 agentree --plugin C:\path\to\plugin --plugin-revoke  # withdraw trust
 ```
 
-Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). A built-in `plugins/software-engineering` plugin provides plan, explore, research, implement, test, advise and review skills, one per role. Plugins are not yet used by a run; the Claude adapter arrives later in v0.6.
+Trust is stored per folder in your user data folder and is dropped when any file in the plugin changes. See [Agent Plugins](docs/PLUGINS.md). A built-in `software-engineering` plugin provides plan, explore, research, implement, test, advise and review skills, one per role. `install.ps1` copies it to your user data folder; a run offers its skills only once you have trusted that copy.
 
 ### Project instructions
 
@@ -185,7 +185,20 @@ See [Project instructions](docs/INSTRUCTIONS.md).
 
 ### Workflow contracts
 
-Role and workflow definitions (`agentree.workflow/1`) describe which roles exist, which models they must use, how work is routed across Fast, Balanced and Thorough paths, and when final review is mandatory. Definitions are validated before anything could run. See [Workflow contracts](docs/WORKFLOWS.md). These contracts are not yet used by a launch; the Claude adapter arrives later in v0.6.
+Role and workflow definitions (`agentree.workflow/1`) describe which roles exist, which models they must use, how work is routed across Fast, Balanced and Thorough paths, and when final review is mandatory. Definitions are validated before anything could run. See [Workflow contracts](docs/WORKFLOWS.md).
+
+### Workflow adapter
+
+Each Claude launch builds its team from the workflow, your saved role settings, the model registry and trusted plugins. Two flags select the workflow:
+
+```powershell
+agentree --workflow-path fast      # fast, balanced (default) or thorough; sets the route for the task
+agentree --workflow FILE           # run an agentree.workflow/1 file instead of the built-in one
+```
+
+Each run writes `adapter-report.txt` next to `instructions.txt` in its run folder (`%LOCALAPPDATA%\ClaudeAgentTree\runs\<id>\`). It lists what is enforced, what is only asked of the lead, saved settings that conflict with the workflow, and notices such as a replaced model or a skill that was not loaded.
+
+Enforcement is limited. Claude Code applies the lead's model, effort, permission mode and advisor, and sets a default model for unnamed subagents (the cheapest bulk-reading model; a per-call model can override it, and it has not been observed in a live session). Bulk roles that need different models must run as named teammates. Agentree cannot verify before launch that Claude Code can run a selected model, so models are reported as configured and eligible, not as confirmed available. It does not apply a model, tool list or permission mode to each named teammate, and it cannot stop the lead from skipping review or reading bulk context on its own model. Those rules are written into the lead's instructions and reported as such; Agentree cannot confirm that they were followed. Plugin skills are offered only from a trusted plugin, and plugin MCP servers are not launched. See [Claude adapter](docs/WORKFLOWS.md#claude-adapter).
 
 ## Use a GitHub issue
 

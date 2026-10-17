@@ -37,7 +37,7 @@ cargo build --release --locked
 .\target\release\claude-agent-tree.exe --help
 ```
 
-Use the checked-in `Cargo.lock`; dependency changes must update it intentionally. No Claude credentials or external API keys are installed on the CI runner. Tests cover the Rust contracts, Claude team association and non-interactive ConPTY/launcher invariants. In particular, the PTY tests exercise session arguments, native team environment settings, terminal response chunking, and on Windows the ability to create a ConPTY, launch a benign child process, and request its termination. Automatic subprocess exit and actual Claude terminal interaction require the manual smoke test. They do **not** constitute a live authenticated Claude Agent Teams integration test.
+Use the checked-in `Cargo.lock`; dependency changes must update it intentionally. The adapter tests (`src/adapter/tests.rs`) run in the same `windows-latest` job. They cover workflow-to-launch translation, skill identity per role, plugin trust failures (untrusted, revoked, changed, malformed, missing), stage flow (dependencies, parallel branches, contracts, ownership, retry bounds), model availability labelling, bulk roles whose cheapest models differ, lowest-cost bulk selection, mandatory strongest review on every path, no silent reviewer downgrade, saved-setting and unnamed-subagent conflicts, strict enforcement, and that the launch arguments, environment, attention path, review markers and Git-write rules are unchanged. No Claude credentials or external API keys are installed on the CI runner. Tests cover the Rust contracts, Claude team association and non-interactive ConPTY/launcher invariants. In particular, the PTY tests exercise session arguments, native team environment settings, terminal response chunking, and on Windows the ability to create a ConPTY, launch a benign child process, and request its termination. Automatic subprocess exit and actual Claude terminal interaction require the manual smoke test. They do **not** constitute a live authenticated Claude Agent Teams integration test.
 
 Before merging a change to the launcher or terminal UI, additionally smoke-test **on a developer's Windows machine with Claude signed in**: launch `agentree`, start an objective, verify the terminal accepts input and permission prompts, observe a named teammate in the dashboard, and ensure review/completion markers and exit cleanup still work. GitHub CI can't validate those third-party interactive behaviours without live credentials.
 
@@ -53,6 +53,96 @@ Manual, on a Windows machine with Claude signed in (CI has no credentials):
 4. Stop Agentree, edit `profiles.json` so the Lead model is `gpt-4`, and restart. The overlay lists the value as replaced with a default.
 5. Set `CLAUDE_TREE_REAL_CLAUDE` to a path that does not exist and press **F5**. The capability matrix opens, reports that no Claude Code CLI was found, and nothing launches.
 
+## Claude native-team smoke test (manual, authenticated)
+
+This procedure has **not been executed** for the Claude adapter (#11). CI has no Claude credentials and cannot run it. Run it on a Windows machine with Claude Code signed in, and record each step's result. Do not describe the adapter as verified against live Claude unless every step has been run and matches its expectation.
+
+Use a throwaway repository. Expectations marked *expect* come from the adapter's code; anything different is a failure to record, not a step to skip.
+
+1. Build and test the release:
+
+   ```powershell
+   cargo test --locked --all-targets
+   cargo build --release --locked
+   ```
+
+2. Install the command and the bundled plugin. Open a new terminal afterwards so `PATH` picks up `agentree`:
+
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -SkipBuild
+   ```
+
+   *Expect:* `%LOCALAPPDATA%\ClaudeAgentTree\plugins\software-engineering\plugin.json` exists.
+
+3. Review the copied plugin, then trust it:
+
+   ```powershell
+   agentree --plugin "$env:LOCALAPPDATA\ClaudeAgentTree\plugins\software-engineering"
+   agentree --plugin "$env:LOCALAPPDATA\ClaudeAgentTree\plugins\software-engineering" --plugin-trust
+   ```
+
+4. Create a scratch repository with one tiny code-changing objective, and commit the baseline so later changes are visible:
+
+   ```powershell
+   $scratch = Join-Path $env:TEMP 'agentree-smoke'
+   New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+   git -C $scratch init
+   Set-Content -LiteralPath (Join-Path $scratch 'README.md') -Value '# smoke'
+   git -C $scratch add -A
+   git -C $scratch commit -m baseline
+   git -C $scratch rev-parse HEAD
+   ```
+
+   Objective (the `--objective` text): `Add add(a, b) returning a + b to calc.py, and test_calc.py with one unittest asserting add(2, 3) == 5. Run python -m unittest and report the result.` The machine needs `python` on `PATH`.
+
+5. Launch on the Fast path:
+
+   ```powershell
+   agentree --project $scratch --objective "<objective from step 4>" --workflow-path fast
+   ```
+
+   Setup pre-fills the objective. Review it, then press **F5** to start.
+
+6. Read the launch record of the run. It is the newest folder under `%LOCALAPPDATA%\ClaudeAgentTree\runs`:
+
+   ```powershell
+   $run = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'ClaudeAgentTree\runs') -Directory | Sort-Object LastWriteTime | Select-Object -Last 1
+   Get-Content (Join-Path $run.FullName 'adapter-report.txt')
+   Get-Content (Join-Path $run.FullName 'instructions.txt')
+   ```
+
+   *Expect* in `adapter-report.txt`: Fast path with explore, implement, test and review; an enforcement table with Enforced, Observed, Instructed and Unsupported rows (Unsupported only if a trusted MCP server is named). *Expect* in `instructions.txt`: the "Role assignments" section gives Explorer the lowest-cost capable registry model (Haiku with the default registry), a bulk-reading paragraph, and the review rules.
+
+7. Check the explorer teammate. In the dashboard, a named Explorer appears. In Claude's session transcript (under `%USERPROFILE%\.claude\projects`), its instructions name the lowest-cost model. Whether it used that model is not confirmed by this step.
+
+8. Check the review markers. The terminal shows `AGENTREE_REVIEW_START:<run id>` as its own line before the advisor call, and `AGENTREE_REVIEW_RESULT:<run id>:PASS` (or `NEEDS_CHANGES`) in the concluding response. *Expect:* the review panel marks the review verified only if a call to the Opus advisor appears in the transcript after the START line. Then `AGENTREE_OBJECTIVE_COMPLETE:<run id>` stops the objective clock.
+
+9. Check the unnamed-subagent variable. Ask the lead, through its shell tool, to print `CLAUDE_CODE_SUBAGENT_MODEL`. *Expect:* the value equals the unnamed-subagent line in `adapter-report.txt`. This shows the variable reached the Claude process. It does not show which model an unnamed subagent actually used.
+
+10. Check the untrusted case. Quit Agentree, then revoke trust and launch the same objective again:
+
+    ```powershell
+    agentree --plugin "$env:LOCALAPPDATA\ClaudeAgentTree\plugins\software-engineering" --plugin-revoke
+    agentree --project $scratch --objective "<objective from step 4>" --workflow-path fast
+    ```
+
+    *Expect:* the launch still starts. `adapter-report.txt` has a notice that the skills were not loaded, with the `--plugin "<dir>" --plugin-trust` command, and `instructions.txt` has no `Skill:` lines. Quit, then trust the plugin again as in step 3.
+
+11. Check saved-setting conflicts. In the Roles overlay (**F4**), select the Thorough profile. *Expect:* `adapter-report.txt` lists each saved-setting conflict (the Coder on Sonnet is one), and the lead's instructions repeat them under "do not hide them". The launch still proceeds.
+
+12. Check the advisor off case. In the Roles overlay, set the advisor to off, then run the Fast path again. *Expect:* no `--advisor` flag, a reported conflict for the advisor, and the review ends BLOCKED: the lead writes `AGENTREE_REVIEW_START:<run id>` and `AGENTREE_REVIEW_RESULT:<run id>:BLOCKED`. The transcript has no Opus advisor call.
+
+13. Confirm that no Git writes happened. Compare with the baseline from step 4:
+
+    ```powershell
+    git -C $scratch rev-parse HEAD
+    git -C $scratch status --short
+    ```
+
+    *Expect:* `HEAD` is unchanged, the implementation changes are uncommitted, and the transcript has no `git add`, `git commit`, `git checkout`, `git switch`, `git reset` or `git stash` calls.
+
+14. Remove the scratch repository when finished: `Remove-Item -Recurse -Force $scratch`.
+
 ## Components
 
 | Source | Purpose |
@@ -66,7 +156,8 @@ Manual, on a Windows machine with Claude signed in (CI has no credentials):
 | `src/profiles.rs` | Saved profiles, per-project overrides, credential references and `roles.json` migration (`profiles.json`) |
 | `src/plugins.rs` | Agent Plugins v1.0 loader: manifest, skill and MCP validation, path containment, and the trust store (`plugins.json`). See [PLUGINS.md](PLUGINS.md) |
 | `plugins/software-engineering/` | Built-in Agent Plugin: plan, explore, research, implement, test, advise and review skills. `roles::Role::skill` maps roles to skills. See [PLUGINS.md](PLUGINS.md#built-in-software-engineering-plugin) |
-| `src/workflow/` | Role and workflow contracts (`agentree.workflow/1`): validation, model registry and mandatory model policies, path routing, evidence handoffs and review. Contracts only; no launch uses them yet. See [WORKFLOWS.md](WORKFLOWS.md) |
+| `src/adapter.rs` | Claude native-team adapter (#11): turns a workflow, the saved role settings, the model registry and trusted plugins into the launch plan, the role section of the lead's instructions and `adapter-report.txt`. Starts nothing. See [WORKFLOWS.md](WORKFLOWS.md#claude-adapter) |
+| `src/workflow/` | Role and workflow contracts (`agentree.workflow/1`): validation, model registry and mandatory model policies, path routing, evidence handoffs and review. The Claude adapter is its only launch consumer. See [WORKFLOWS.md](WORKFLOWS.md) |
 | `examples/workflows/` | Built-in software-engineering workflow definition. Regenerate it with `AGENTREE_WRITE_EXAMPLES=1 cargo test workflow`; a normal test run fails if it no longer matches the code |
 | `src/team.rs` | Native team discovery and shared-task status |
 | `src/telemetry.rs` | Local JSONL transcript parsing, usage and cost estimates; emits core events |
@@ -106,7 +197,7 @@ Opus advice and final-review requests are model-directed, not externally enforce
 
 Settings reach Claude in two ways, and `roles::applies` labels each one:
 
-- **Enforced** by a launch flag: the lead model (`--model`), lead effort (`--effort`), lead permission mode (`--permission-mode`), and the advisor (`--advisor`, omitted when off). Unnamed subagents use the Coder model through `CLAUDE_CODE_SUBAGENT_MODEL`.
+- **Enforced** by a launch flag: the lead model (`--model`), lead effort (`--effort`), lead permission mode (`--permission-mode`), and the advisor (`--advisor`, omitted when off). Unnamed subagents get a default model through `CLAUDE_CODE_SUBAGENT_MODEL`; the Claude adapter sets it to the cheapest bulk-reading model (the Coder's model before the adapter), and a per-call model overrides it. Bulk roles whose cheapest models differ cannot share that one default, so they are told to run as named teammates.
 - **Instruction to lead** only: teammate models, concurrency limits and permission modes. `Settings::notes` says Agentree cannot confirm them. Do not describe them as enforced.
 
 Preflight checks the effort and permission values against the same lists in `roles.rs`, and blocks only when the plan sets a flag the CLI rejects. The final reviewer is labelled "via the Opus advisor" because it runs through the advisor.

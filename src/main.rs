@@ -1,3 +1,4 @@
+mod adapter;
 mod capability;
 mod github;
 mod instructions;
@@ -88,6 +89,17 @@ struct Args {
         conflicts_with_all = ["project", "issue", "objective", "demo", "plugin"]
     )]
     instructions: Option<PathBuf>,
+    /// Run the workflow in FILE (agentree.workflow/1) instead of the built-in software-engineering one.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["plugin", "instructions"])]
+    workflow: Option<PathBuf>,
+    /// Execution path for the workflow: fast, balanced (default) or thorough. The budget cap still applies.
+    #[arg(
+        long,
+        value_name = "PATH",
+        value_parser = adapter::parse_path,
+        conflicts_with_all = ["plugin", "instructions"]
+    )]
+    workflow_path: Option<workflow::contract::ExecutionPath>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Prefs {
@@ -188,6 +200,8 @@ pub struct Attention {
 }
 
 pub struct App {
+    workflow_file: Option<PathBuf>,
+    workflow_path: Option<workflow::contract::ExecutionPath>,
     pub page: Page,
     pub focus: Focus,
     pub project: String,
@@ -322,6 +336,8 @@ impl App {
             agent_done_elapsed: HashMap::new(),
             session_started_at: SystemTime::now(),
             demo: args.demo,
+            workflow_file: args.workflow,
+            workflow_path: args.workflow_path,
             output_end: false,
             last_team_poll: Instant::now(),
             terminal_size: (24, 80),
@@ -354,7 +370,10 @@ impl App {
         }
     }
     fn refresh_capabilities(&mut self, discovery: capability::Discovery) {
-        self.launch_problems = capability::preflight(&self.role_settings.plan(), &discovery);
+        self.refresh_for(&self.role_settings.plan(), discovery);
+    }
+    fn refresh_for(&mut self, plan: &capability::RolePlan, discovery: capability::Discovery) {
+        self.launch_problems = capability::preflight(plan, &discovery);
         self.capabilities = Some(discovery);
     }
     /// The settings the Roles overlay shows: those of the layer it edits. In global scope that is
@@ -468,8 +487,12 @@ impl App {
         }
     }
     /// Blocks the launch with the first problem and opens the matrix when the plan is invalid.
-    fn check_launch(&mut self, discovery: capability::Discovery) -> Result<()> {
-        self.refresh_capabilities(discovery);
+    fn check_launch(
+        &mut self,
+        plan: &capability::RolePlan,
+        discovery: capability::Discovery,
+    ) -> Result<()> {
+        self.refresh_for(plan, discovery);
         let Some(first) = self.launch_problems.first() else {
             return Ok(());
         };
@@ -669,9 +692,27 @@ impl App {
         self.settings_key = profiles::project_key(&project);
         self.role_settings = self.profiles.effective(&self.settings_key);
         self.settings_for = self.project.clone();
-        // Validate the plan before anything is saved or spawned. Demo mode launches nothing.
+        // The Claude adapter turns the workflow, registry, trusted plugins and these settings into
+        // the plan that launches. Demo mode launches nothing and skips it.
+        let brief = if cli.is_some() {
+            Some(
+                adapter::prepare(
+                    &self.role_settings,
+                    self.workflow_file.as_deref(),
+                    self.workflow_path,
+                    &adapter::Dirs::standard(&data_home()),
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        } else {
+            None
+        };
+        let plan = brief
+            .as_ref()
+            .map_or_else(|| self.role_settings.plan(), |b| b.plan.clone());
+        // Validate the plan before anything is saved or spawned.
         if let Some(cli) = &cli {
-            self.check_launch(capability::discover(Some(cli)))?;
+            self.check_launch(&plan, capability::discover(Some(cli)))?;
         }
         self.project = project.display().to_string();
         let mut pref = read_prefs();
@@ -685,9 +726,16 @@ impl App {
         self.run_dir = data_home().join("runs").join(&self.session_id);
         self.attention_file = self.run_dir.join("attention.json");
         fs::create_dir_all(&self.run_dir)?;
-        let plan = self.role_settings.plan();
         let policy_file = self.run_dir.join("instructions.txt");
-        let mut policy = prompt::system_policy(&self.attention_file, &self.session_id, &plan);
+        let mut policy = match &brief {
+            Some(b) => prompt::system_policy_with(
+                &self.attention_file,
+                &self.session_id,
+                &plan,
+                &b.assignments(),
+            ),
+            None => prompt::system_policy(&self.attention_file, &self.session_id, &plan),
+        };
         // A resolver error must not block the launch: no note, and the reason is recorded.
         let (note, provenance, status) = match instructions::resolve(&project) {
             Ok(r) => (r.lead_note(), r.render(), r.status_line()),
@@ -704,6 +752,9 @@ impl App {
         // Provenance for this run, next to the policy it produced.
         fs::write(self.run_dir.join("instructions-resolved.txt"), provenance)?;
         fs::write(&policy_file, policy)?;
+        if let Some(b) = &brief {
+            fs::write(self.run_dir.join("adapter-report.txt"), b.report())?;
+        }
         let initial = prompt::initial_objective(&self.objective, &plan);
         self.terminal_expanded = false;
         self.dashboard_expanded = false;
@@ -732,6 +783,9 @@ impl App {
             );
             if let Some(line) = status {
                 self.message.push_str(&format!(" | {line}"));
+            }
+            if let Some(b) = &brief {
+                self.message.push_str(&format!(" | {}", b.status_line()));
             }
         } else {
             self.terminal.process(b"\x1b[32mDEMO - no Claude process launched\x1b[0m\r\nNative teammates and attention are simulated only in --demo mode.\r\n");
@@ -1504,6 +1558,22 @@ mod tests {
         assert_eq!(a.run_elapsed(), Duration::from_secs(42));
     }
     #[test]
+    fn workflow_flags_parse_and_do_not_mix_with_inspection_modes() {
+        let parse = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("agentree").chain(args.iter().copied()))
+        };
+        let a = parse(&["--workflow-path", "Fast", "--workflow", "w.json"]).unwrap();
+        assert_eq!(
+            a.workflow_path,
+            Some(workflow::contract::ExecutionPath::Fast)
+        );
+        assert_eq!(a.workflow, Some(PathBuf::from("w.json")));
+        assert!(parse(&["--workflow-path", "slow"]).is_err());
+        assert!(parse(&["--plugin", "p", "--workflow", "w.json"]).is_err());
+        assert!(parse(&["--instructions", "d", "--workflow-path", "fast"]).is_err());
+        assert_eq!(parse(&[]).unwrap().workflow_path, None);
+    }
+    #[test]
     fn issue_flag_conflicts_with_objective_and_requires_project() {
         let parse = |args: &[&str]| {
             Args::try_parse_from(std::iter::once("agentree").chain(args.iter().copied()))
@@ -1624,7 +1694,10 @@ mod tests {
             demo: true,
             ..Args::default()
         });
-        let err = a.check_launch(old_cli).unwrap_err().to_string();
+        let err = a
+            .check_launch(&a.role_settings.plan(), old_cli)
+            .unwrap_err()
+            .to_string();
         assert!(err.starts_with("Launch blocked:"), "{err}");
         assert!(
             err.contains("--advisor") && err.contains("claude update"),
@@ -1641,7 +1714,7 @@ mod tests {
             ],
         };
         a.capabilities_open = false;
-        assert!(a.check_launch(ok).is_ok());
+        assert!(a.check_launch(&a.role_settings.plan(), ok).is_ok());
         assert!(a.launch_problems.is_empty());
         assert!(!a.capabilities_open);
     }
@@ -1895,7 +1968,10 @@ mod tests {
                 note: String::new(),
             }],
         };
-        let err = a.check_launch(no_model).unwrap_err().to_string();
+        let err = a
+            .check_launch(&a.role_settings.plan(), no_model)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("--model"), "{err}");
         assert!(a.capabilities_open);
         assert!(a.session.is_none());
