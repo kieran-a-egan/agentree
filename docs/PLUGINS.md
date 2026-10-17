@@ -2,7 +2,7 @@
 
 Agentree loads [Agent Plugins v1.0](https://agent-plugins.org) (schema `1.0.0`): a folder holding a `plugin.json`, optional skills and optional MCP server declarations. Loading only reads and validates files. Nothing in a plugin runs unless you trust it, and trust is bound to the plugin's exact contents.
 
-The loader is `src/plugins.rs`. Role and workflow definitions that *use* plugin skills are Agentree's own and live outside this standard (v0.6, later issues).
+The loader is `src/plugins.rs`. Role and workflow definitions that *use* plugin skills are Agentree's own and live outside this standard (see [Workflow contracts](WORKFLOWS.md)).
 
 ## Layout
 
@@ -51,7 +51,9 @@ Everything skipped or ignored is listed as a *note* by `--plugin`.
 | Advisor | `advise` | question, evidence | one recommendation with reasoning | no |
 | Final reviewer | `review` | diff, objective, evidence | `PASS` / `NEEDS_CHANGES` / `BLOCKED` with findings | no |
 
-`roles::Role::skill()` is a fixed role-to-skill table; the Lead has none. Configurable role and workflow definitions are a separate v0.6 issue (#9). The advisor and final reviewer run through Claude's parameterless advisor tool, which cannot load a skill itself, so the lead has to supply the `advise` or `review` text when it consults the advisor. Tests check that the plugin loads with no issues, that every role resolves to exactly one skill, and that each `SKILL.md` has Inputs, Outputs and Limits sections. The plugin is trusted like any other (`agentree --plugin plugins\software-engineering --plugin-trust`); it is not yet used by a run, and the installer does not copy it next to the binary (that comes with the Claude adapter), so the native-team launch and the lead prompt are unchanged.
+`roles::Role::skill()` is a fixed role-to-skill table; the Lead has none. The Claude adapter (`src/adapter.rs`) maps the built-in workflow's roles to these skills. A skill is offered to a role only if its plugin passes `Store::activate` at launch, and the lead is given the path to its `SKILL.md`. Claude Code does not load plugin skills for named teammates, so this is an instruction, not a guarantee. The advisor and final reviewer run through Claude's parameterless advisor tool, which cannot load a skill itself, so the lead is told to read the `review` skill before the final review and the `advise` skill before it consults the advisor for a blocker. Tests check that the plugin loads with no issues, that every role resolves to exactly one skill, and that each `SKILL.md` has Inputs, Outputs and Limits sections.
+
+The plugin is trusted like any other (`agentree --plugin plugins\software-engineering --plugin-trust`). `install.ps1` copies it to `%LOCALAPPDATA%\ClaudeAgentTree\plugins\software-engineering`. Trust is bound to that folder, so review and trust the copy with `agentree --plugin "%LOCALAPPDATA%\ClaudeAgentTree\plugins\software-engineering" --plugin-trust`. An untrusted or changed plugin is not an error: the built-in workflow runs without skills and the launch report says how to trust it.
 
 ## Trust
 
@@ -75,6 +77,6 @@ A plugin may contain at most 10,000 entries and 64 MiB; larger ones are refused.
 
 ## Not in this version
 
-- Role/workflow definitions and the Claude adapter that turn trusted skills into a team workflow arrive in later v0.6 issues. Until then `--plugin` is how you inspect and trust; nothing launches a plugin's MCP servers yet.
+- Plugin MCP servers are validated and can be trusted, but no launch runs them. The Claude adapter does not pass them to Claude Code, and the adapter report lists them as unsupported. Use `--plugin` to inspect and trust a plugin; trust does not start its servers.
 - `PLUGIN_DATA` folders (`%LOCALAPPDATA%\ClaudeAgentTree\plugin-data\<name>`) are computed but created only when a server is launched.
 - Skill frontmatter is checked for the fields the Agent Skills specification requires, not for every optional field.

@@ -4,8 +4,18 @@ use std::path::Path;
 /// The lead's standing instructions. Role assignments and the advisor paragraph come from `plan`,
 /// so the text Claude receives matches the flags it was launched with.
 pub fn system_policy(attention_file: &Path, run_token: &str, plan: &RolePlan) -> String {
+    system_policy_with(attention_file, run_token, plan, &assignment_lines(plan))
+}
+
+/// As [`system_policy`], with the role section supplied by the Claude adapter
+/// (`adapter::Brief::assignments`) in place of the fixed role list.
+pub fn system_policy_with(
+    attention_file: &Path,
+    run_token: &str,
+    plan: &RolePlan,
+    assignments: &str,
+) -> String {
     let path = attention_file.display().to_string().replace('\\', "/");
-    let assignments = assignment_lines(plan);
     let advisor = advisor_paragraph(plan, run_token);
     format!(
         r#"You are the LEAD of a native Claude Code AGENT TEAM, running in an interactive session.

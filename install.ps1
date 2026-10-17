@@ -39,6 +39,20 @@ $destination = Join-Path $bin 'agentree.exe'
 Copy-Item -LiteralPath $exe -Destination $destination -Force
 Set-Content -LiteralPath (Join-Path $bin 'claude-original.txt') -Value $ClaudeCli -Encoding UTF8
 
+# The bundled plugin is copied beside the data folder, where the adapter looks for it. It is not trusted here.
+$pluginSource = Join-Path $PSScriptRoot 'plugins\software-engineering'
+$pluginsHome = Join-Path $homeDir 'plugins'
+$pluginDest = Join-Path $pluginsHome 'software-engineering'
+if (Test-Path -LiteralPath $pluginSource -PathType Container) {
+    New-Item -ItemType Directory -Force -Path $pluginsHome | Out-Null
+    if (Test-Path -LiteralPath $pluginDest) { Remove-Item -LiteralPath $pluginDest -Recurse -Force }
+    Copy-Item -LiteralPath $pluginSource -Destination $pluginDest -Recurse -Force
+    Write-Host "Copied bundled plugin: $pluginDest" -ForegroundColor Green
+    Write-Host "To let runs use its skills, review and trust it: agentree --plugin `"$pluginDest`" --plugin-trust" -ForegroundColor Yellow
+} else {
+    Write-Warning "Bundled plugin not found at $pluginSource. Runs will not offer its skills."
+}
+
 foreach ($shimName in @('agentree.cmd','claude.cmd')) {
     $legacyShim = Join-Path $bin $shimName
     if (Test-Path -LiteralPath $legacyShim -PathType Leaf) {

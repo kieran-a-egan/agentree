@@ -14,7 +14,7 @@ This module provides:
 
 It does not provide an execution engine (v0.8), a multi-provider runtime (v0.7) or a durable scheduler (v0.9). Nothing in this module calls Claude, starts a process or reads a model's output.
 
-The consumer is the Claude adapter (Issue #11). It takes a `ValidatedWorkflow`, calls `route::route` to choose a path, and uses `route::resolve` and `Registry::select_*` to pick models. Until #11 lands, no launch path uses these contracts, and the default Claude Code launch is unchanged.
+The consumer is the Claude adapter (`src/adapter.rs`, Issue #11). It takes a `ValidatedWorkflow`, calls `route::route` to choose a path, and uses `route::resolve` and `check_settings` to pick models and find conflicts. It is the only launch path that uses these contracts; see [Claude adapter](#claude-adapter).
 
 ## Definition format
 
@@ -129,7 +129,7 @@ A policy is *enforced* only when the backend makes it impossible to break. Promp
 | Final review gate | Observed, not prevented | The review marker `AGENTREE_REVIEW_RESULT` is observed after the fact. The lead can skip review. |
 | Reviewer independence and diff delivery | Instruction only | On Claude the reviewer is the advisor, which sees the lead's whole conversation. It does not receive a separate `ReviewPacket`. |
 | Lead session bulk reading | Instruction only | The lead is not a workflow role, so it can read bulk context itself on its own model. It is only asked to delegate. |
-| Unnamed subagent model | Flagged by `check_settings` | Claude has one model for unnamed subagents and Agentree sets it to the Coder's. A pricier Coder moves exploration subagents off the lowest-cost tier. |
+| Unnamed subagent model | Default set, instruction only | Claude has one default model for unnamed subagents. The adapter sets it through `CLAUDE_CODE_SUBAGENT_MODEL` to the bulk-reading model, not the Coder's. A per-call `model` argument or an agent definition's model overrides the default, so the lead is also told to pass no override. `check_settings` reports a Coder model that is not the lowest-cost capable one, and the adapter drops that conflict only because it replaced the default. |
 
 With `strict_enforcement: false` (the default), each gap is listed as a limitation on the `ValidatedWorkflow`. With `strict_enforcement: true`, each gap is a validation failure. The built-in workflow therefore fails strict validation on Claude native teams. That is the intended result until a backend can enforce these policies.
 
@@ -144,9 +144,75 @@ With `strict_enforcement: false` (the default), each gap is listed as a limitati
 
 A saved profile therefore cannot quietly override a mandatory policy. Today the built-in **Thorough** profile (Coder on Sonnet) and **Local** profile (advisor off) are reported; that is a real conflict with the contracts, shown rather than hidden. The check reports; it does not change settings.
 
+## Claude adapter
+
+`src/adapter.rs` (Issue #11) turns a `ValidatedWorkflow`, the saved role settings, the model registry (`registry::claude_default()`) and the trusted plugins into a launch. It runs for every Claude launch except `--demo`. The result is applied to the existing launch: one Claude lead and its named teammates. The adapter starts nothing and adds no scheduler.
+
+It provides three things:
+
+- a launch plan (`RolePlan`): the lead's flags, the unnamed-subagent environment variable and the teammate lines;
+- the role section of the lead's instructions, which replaces the fixed role list;
+- `adapter-report.txt` in the run folder, beside `instructions.txt`: the enforcement table, saved-setting conflicts and notices.
+
+If the workflow cannot be satisfied, the launch is blocked with every reason at once (`Launch blocked by workflow policy: ...`). Nothing is saved or spawned.
+
+### What Claude Code enforces
+
+| Policy | Level | How |
+| --- | --- | --- |
+| Lead model, effort, permission mode, advisor | Enforced | Launch flags `--model`, `--effort`, `--permission-mode`, `--advisor`. |
+| Advisor model used for the final review | Enforced | `--advisor` is the alias of the strongest eligible reviewer (`opus`). That the review happens, and that it is independent, is not enforced (see below). |
+
+### What it only instructs
+
+| Policy | Level | Why |
+| --- | --- | --- |
+| Teammate model, concurrency, permission mode and tools | Instructed | Written into the lead's prompt. Claude Code does not apply them to each named teammate. |
+| Bulk reading goes to bulk-reading teammates | Instructed | The lead is asked to delegate and to take back compact evidence. It can still read on its own model. |
+| Skills | Instructed | Offered only after the trust gate (below). The lead is given the path to each `SKILL.md`; Claude Code does not load plugin skills for named teammates. |
+| Review packet and reviewer independence | Instructed | The advisor sees the lead's whole conversation, not a separate packet. |
+| Final review cannot be skipped | Observed | The `AGENTREE_REVIEW_START` and `AGENTREE_REVIEW_RESULT` markers are read after the fact. |
+| Git writes need human authorization | Instructed | Stated to the lead. Claude Code's own permission prompts still apply. |
+
+### What is unsupported
+
+MCP servers declared by trusted plugins are not passed to Claude Code, and the report lists them as unsupported. Agentree does not launch them, even when the plugin is trusted.
+
+### Model policy
+
+- **Bulk readers** (Explorer, Researcher) use the lowest-cost capable model in the registry. A saved pricier model is replaced and the replacement is reported. A pricier model is used only with an explicit human authorization. There is no interface for that yet, so the launch is blocked and lists the options.
+- **Final review** uses the strongest eligible model by `intelligence`, not the most expensive one, and the advisor must be able to run it. If the advisor cannot run it, or it is unavailable, the launch is blocked. A weaker reviewer needs an explicit human authorization. Nothing is downgraded silently.
+- **Advisor off** stays off. The final review then ends BLOCKED, and the setting is reported as a conflict.
+- **Other roles** use their saved model. A role with a `pinned` policy uses the workflow's model. Each teammate's concurrency is the lower of its saved setting and the workflow's `max_concurrent`.
+
+### Routing and `--workflow-path`
+
+`--workflow-path fast|balanced|thorough` sets the task complexity used by `route::route`: fast gives a small task (Fast path), balanced gives a medium one (Balanced path, the default) and thorough gives a large one (Thorough path). The adapter assumes medium risk and that code changes, so review is always required. The budget cap (`policy.max_path`) still applies, and routing never selects a model.
+
+`--workflow FILE` runs an `agentree.workflow/1` definition instead of the built-in one. It is validated like the built-in one, with no fallback.
+
+### Saved-setting conflicts
+
+`route::check_settings` compares the saved settings with the mandatory policies (see [Settings bridge](#settings-bridge)). Each conflict is listed in `adapter-report.txt` and in the lead's instructions. The launch goes ahead with the policy applied; the adapter never changes a saved setting. For example, the Thorough profile's Coder on Sonnet no longer sets the unnamed-subagent default: the adapter replaces it with the bulk-reading model and reports that as a notice instead of a conflict. A pricier Explorer is both replaced and reported as a conflict. The advisor set to off is reported as described above.
+
+### Skills and the trust gate
+
+Only the bundled `software-engineering` plugin is loaded in this release. A `--workflow` file that names any other plugin is rejected as not loaded, even if that plugin is trusted.
+
+The built-in workflow maps roles to the skills of the `software-engineering` plugin: Planner to `plan`, Explorer to `explore`, Researcher to `research`, Coder to `implement`, Tester to `test` and Final reviewer to `review`. The advisor uses `advise` from the review role's plugin. The Lead has no skill.
+
+A skill is offered only if its plugin passes `Store::activate` at launch, which hashes the folder again. If the plugin is missing, untrusted or changed, the built-in workflow runs without skills and a notice gives the command to trust it, `agentree --plugin "<dir>" --plugin-trust`. A workflow file has no such fallback: validation fails.
+
+The bundled plugin is searched for in this order: `AGENTREE_PLUGIN_DIR`; `%LOCALAPPDATA%\ClaudeAgentTree\plugins\software-engineering` (copied there by `install.ps1`); a `plugins\software-engineering` folder next to the executable; the same relative folder two levels up (for a build in a checkout's `target` folder); and the checkout's own `plugins` folder. If none is found, the notice says to re-run `install.ps1` or set `AGENTREE_PLUGIN_DIR`. Trust is per folder, so trust the copy that will be used.
+
+### Strict mode
+
+`strict_enforcement: true` turns each instruction-only or observed gap into a validation failure. On Claude native teams every strict workflow therefore fails validation, which is why the built-in workflow runs non-strict. With strict on, the launch also fails on any saved-setting conflict and on any unsupported policy, such as an MCP server.
+
 ## Not implemented yet
 
-- **No consumer.** No launch path calls `route`, `resolve`, `check_settings`, `assign_reviewer`, `validate_verdict` or `next_action` yet. The Claude adapter (#11) is the first.
+- **Review contract functions.** Nothing calls `assign_reviewer`, `validate_verdict` or `next_action` yet: on Claude the verdict arrives as a marker line, not a `ReviewVerdict`, and Agentree does not parse or validate it.
+- **Named-teammate enforcement.** Claude Code does not apply a model, tool list or permission mode to a named teammate, so those remain instructions (see [Claude adapter](#claude-adapter)).
 - **Concurrency** is the per-role `max_concurrent` (1 to 4); there is no workflow-wide parallel cap.
 - **Spend limits** and **durable repair loops** (state that survives a restart) are v0.9.
 - **Pi, local models and other backends** are v0.7. `BackendProfile` is the place to describe each one.

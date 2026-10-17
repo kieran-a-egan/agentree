@@ -82,8 +82,8 @@ impl Role {
     /// The skill this role uses from the built-in `software-engineering` plugin
     /// (`plugins/software-engineering`). The Lead coordinates and has none. Each skill belongs to
     /// one role and can be loaded without the others.
-    // ponytail: a fixed table; user-defined role/skill mappings arrive with role definitions (#9).
-    #[allow(dead_code)] // No launch consumer until the v0.6 Claude adapter; covered by tests.
+    // ponytail: a fixed table; the workflow definition names each role's skill and the adapter
+    // uses this only for the Advisor, which has no workflow stage.
     pub fn skill(self) -> Option<&'static str> {
         match self {
             Role::Lead => None,
@@ -385,7 +385,7 @@ impl Settings {
             notes.push(
                 "Teammate models, concurrency limits and permission modes are instructions in \
                  the lead's prompt. Claude Code does not apply them per teammate, so Agentree \
-                 cannot confirm them."
+                 cannot confirm them. At launch the workflow adapter replaces a pricier                  Explorer or Researcher model with the lowest-cost capable one, and unnamed                  subagents use that model instead of the Coder's."
                     .into(),
             );
         }
