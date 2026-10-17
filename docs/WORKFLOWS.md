@@ -58,7 +58,7 @@ The decision has no model field. **Routing never selects models**, and a higher-
 
 - `intelligence` and `cost` are separate explicit numbers. Intelligence is never derived from price, and cost is never derived from intelligence.
 - `context_tokens`, `tools`, `max_permission`, `data_classes`: what the model can do.
-- `available`: runtime availability, set from discovery or health checks. Selection never assumes it.
+- `available`: `false` when a discovery or health check found the model unavailable. Selection never assumes it. `true` means only "not known to be unavailable": the Claude adapter does not report such a model as a verified runtime model (see [Model policy](#model-policy)).
 
 Reviewers are ranked by `intelligence`, always. `review_priority` only orders models of *equal* intelligence. A list that would put a weaker model ahead of, or leave out, a stronger one is a registry validation error, and selection ignores the conflict rather than obeying it. To keep a model from reviewing, restrict its `tools`, `max_permission` or `data_classes`: selection always honours those. `claude_default()` is the Claude Code registry (Haiku, Sonnet, Opus with aliases). Its numbers are defaults, and no selection code reads a model name.
 
@@ -129,7 +129,7 @@ A policy is *enforced* only when the backend makes it impossible to break. Promp
 | Final review gate | Observed, not prevented | The review marker `AGENTREE_REVIEW_RESULT` is observed after the fact. The lead can skip review. |
 | Reviewer independence and diff delivery | Instruction only | On Claude the reviewer is the advisor, which sees the lead's whole conversation. It does not receive a separate `ReviewPacket`. |
 | Lead session bulk reading | Instruction only | The lead is not a workflow role, so it can read bulk context itself on its own model. It is only asked to delegate. |
-| Unnamed subagent model | Default set, instruction only | Claude has one default model for unnamed subagents. The adapter sets it through `CLAUDE_CODE_SUBAGENT_MODEL` to the bulk-reading model, not the Coder's. A per-call `model` argument or an agent definition's model overrides the default, so the lead is also told to pass no override. `check_settings` reports a Coder model that is not the lowest-cost capable one, and the adapter drops that conflict only because it replaced the default. |
+| Unnamed subagent model | Default set, instruction only | Claude has one default model for unnamed subagents. The adapter sets it through `CLAUDE_CODE_SUBAGENT_MODEL` to the cheapest of the bulk-reading roles' models, not the Coder's. Bulk roles that resolve to different models cannot all be matched by one variable: those roles must run as named teammates with their own model, and the lead is told so. A per-call `model` argument or an agent definition's model overrides the default, so the lead is also told to pass no override. `check_settings` reports a Coder model that is not the lowest-cost capable one, and the adapter drops that conflict only because it replaced the default. |
 
 With `strict_enforcement: false` (the default), each gap is listed as a limitation on the `ValidatedWorkflow`. With `strict_enforcement: true`, each gap is a validation failure. The built-in workflow therefore fails strict validation on Claude native teams. That is the intended result until a backend can enforce these policies.
 
@@ -151,7 +151,7 @@ A saved profile therefore cannot quietly override a mandatory policy. Today the 
 It provides three things:
 
 - a launch plan (`RolePlan`): the lead's flags, the unnamed-subagent environment variable and the teammate lines;
-- the role section of the lead's instructions, which replaces the fixed role list;
+- the role section of the lead's instructions, which replaces the fixed role list. It begins with the stage flow: for each active stage, read from the validated workflow, what it waits for (`depends_on` plus the optional dependencies that run on the chosen path), which stages may run in parallel with it, its inputs (with their source stage and output, and whether required), its outputs, the workspace paths it owns, and its attempt and repair bounds with what happens on exhaustion. Like the rest of the section, this is an instruction: Claude Code does not schedule, gate or sandbox stages;
 - `adapter-report.txt` in the run folder, beside `instructions.txt`: the enforcement table, saved-setting conflicts and notices.
 
 If the workflow cannot be satisfied, the launch is blocked with every reason at once (`Launch blocked by workflow policy: ...`). Nothing is saved or spawned.
@@ -167,6 +167,8 @@ If the workflow cannot be satisfied, the launch is blocked with every reason at 
 
 | Policy | Level | Why |
 | --- | --- | --- |
+| Stage order, input and output contracts, path ownership, retry bounds | Instructed | Read from the validated workflow into the lead's prompt. Claude Code does not schedule, gate or sandbox stages. |
+| Model runtime availability | Instructed | Selected models are configured and eligible; Agentree cannot verify that Claude Code can run them before launch. The lead is told to stop and ask, not substitute. |
 | Teammate model, concurrency, permission mode and tools | Instructed | Written into the lead's prompt. Claude Code does not apply them to each named teammate. |
 | Bulk reading goes to bulk-reading teammates | Instructed | The lead is asked to delegate and to take back compact evidence. It can still read on its own model. |
 | Skills | Instructed | Offered only after the trust gate (below). The lead is given the path to each `SKILL.md`; Claude Code does not load plugin skills for named teammates. |
@@ -181,6 +183,7 @@ MCP servers declared by trusted plugins are not passed to Claude Code, and the r
 ### Model policy
 
 - **Bulk readers** (Explorer, Researcher) use the lowest-cost capable model in the registry. A saved pricier model is replaced and the replacement is reported. A pricier model is used only with an explicit human authorization. There is no interface for that yet, so the launch is blocked and lists the options.
+- **Availability.** A model is *configured and eligible* when the registry lists it and selection accepts it. It is *verified* only if something confirmed that the running Claude Code can use it. Claude Code has no model-listing command and the capability probes do not start a session, so Agentree verifies nothing before launch (`Request::verified` is empty in `prepare`). The lead's instructions and `adapter-report.txt` list every selected model as "configured and eligible; runtime availability not verified" and tell the lead to stop and ask the human, not substitute a model, if Claude Code cannot run it. A registry entry marked unavailable still blocks the launch as before.
 - **Final review** uses the strongest eligible model by `intelligence`, not the most expensive one, and the advisor must be able to run it. If the advisor cannot run it, or it is unavailable, the launch is blocked. A weaker reviewer needs an explicit human authorization. Nothing is downgraded silently.
 - **Advisor off** stays off. The final review then ends BLOCKED, and the setting is reported as a conflict.
 - **Other roles** use their saved model. A role with a `pinned` policy uses the workflow's model. Each teammate's concurrency is the lower of its saved setting and the workflow's `max_concurrent`.
@@ -193,7 +196,7 @@ MCP servers declared by trusted plugins are not passed to Claude Code, and the r
 
 ### Saved-setting conflicts
 
-`route::check_settings` compares the saved settings with the mandatory policies (see [Settings bridge](#settings-bridge)). Each conflict is listed in `adapter-report.txt` and in the lead's instructions. The launch goes ahead with the policy applied; the adapter never changes a saved setting. For example, the Thorough profile's Coder on Sonnet no longer sets the unnamed-subagent default: the adapter replaces it with the bulk-reading model and reports that as a notice instead of a conflict. A pricier Explorer is both replaced and reported as a conflict. The advisor set to off is reported as described above.
+`route::check_settings` compares the saved settings with the mandatory policies (see [Settings bridge](#settings-bridge)). Each conflict is listed in `adapter-report.txt` and in the lead's instructions. The launch goes ahead with the policy applied; the adapter never changes a saved setting. For example, the Thorough profile's Coder on Sonnet no longer sets the unnamed-subagent default: the adapter replaces it with the cheapest bulk-reading model and reports that as a notice instead of a conflict. A pricier Explorer is both replaced and reported as a conflict. The advisor set to off is reported as described above.
 
 ### Skills and the trust gate
 

@@ -1,6 +1,7 @@
 use super::*;
 use crate::roles::MODELS;
 use crate::workflow::contract::{default_workflow, fixtures};
+use crate::workflow::contract::{Input, OutputRef, StagePolicy};
 use crate::workflow::registry::claude_default;
 use uuid::Uuid;
 
@@ -62,6 +63,8 @@ fn trusted_env() -> Env {
     }
 }
 
+static NOTHING_VERIFIED: BTreeSet<String> = BTreeSet::new();
+
 fn request<'a>(
     wf: &'a ValidatedWorkflow,
     settings: &'a Settings,
@@ -73,6 +76,7 @@ fn request<'a>(
         workflow: wf,
         settings,
         registry,
+        verified: &NOTHING_VERIFIED,
         plugins: &env.plugins,
         trust: &env.trust,
         task: task_for(path),
@@ -648,4 +652,271 @@ fn the_checkout_plugin_is_found_without_an_install() {
     assert!(env.notices.is_empty());
     // Nothing is trusted yet, so nothing is active.
     assert!(env.trust.activate(&env.plugins[0]).is_none());
+}
+
+fn stage<'a>(b: &'a Brief, id: &str) -> &'a StageBrief {
+    b.flow.iter().find(|s| s.id == id).unwrap()
+}
+
+fn strs(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn the_flow_comes_from_the_workflow_and_differs_by_path() {
+    let thorough = brief(Some(ExecutionPath::Thorough));
+    assert_eq!(thorough.flow.len(), 8);
+    // Independent branches are parallel; dependants are sequential.
+    assert_eq!(stage(&thorough, "explore").waits_for, Vec::<String>::new());
+    assert_eq!(stage(&thorough, "explore").parallel_with, ["research"]);
+    assert_eq!(stage(&thorough, "plan").waits_for, ["explore", "research"]);
+    assert!(stage(&thorough, "plan").parallel_with.is_empty());
+    assert_eq!(
+        stage(&thorough, "prepare-review").parallel_with,
+        ["risk-scan"]
+    );
+    assert_eq!(
+        stage(&thorough, "review").waits_for,
+        ["implement", "test", "prepare-review", "risk-scan"]
+    );
+    // Contracts and ownership are the stage's own.
+    let implement = stage(&thorough, "implement");
+    assert_eq!(implement.waits_for, ["explore", "plan"]);
+    assert_eq!(
+        implement.inputs,
+        [
+            (
+                "evidence".to_string(),
+                Some("explore.evidence".to_string()),
+                true
+            ),
+            ("plan".to_string(), Some("plan.plan".to_string()), false),
+            ("objective".to_string(), None, true),
+        ]
+    );
+    assert_eq!(
+        implement.outputs,
+        [("diff".to_string(), "diff".to_string())]
+    );
+    assert_eq!(implement.owns, ["."]);
+    assert!(stage(&thorough, "test").owns.is_empty());
+    assert_eq!(
+        (implement.max_attempts, implement.max_repair_cycles),
+        (2, 2)
+    );
+    // On Fast the optional plan does not exist: no wait and no input from it.
+    let fast = brief(Some(ExecutionPath::Fast));
+    let implement = stage(&fast, "implement");
+    assert_eq!(implement.waits_for, ["explore"]);
+    assert!(implement.inputs.iter().all(|i| i.0 != "plan"));
+    assert_eq!(stage(&fast, "review").waits_for, ["implement", "test"]);
+    assert!(fast.flow.iter().all(|s| s.id != "research"));
+    // The lead is told, and told it is only an instruction.
+    let text = thorough.assignments();
+    for needle in [
+        "- explore (Explorer): starts immediately; may run in parallel with research.",
+        "- plan (Planner): waits for explore, research; nothing may run alongside it.",
+        "Inputs: evidence (from explore.evidence, required); research (from research.evidence, optional)",
+        "Outputs: diff (diff). Owns the whole workspace",
+        "Owns no workspace paths: it must not write files.",
+        "at most 2 attempt(s) and 2 repair cycle(s); then stop and ask the human through the attention file",
+        "Claude Code does not schedule, gate or sandbox these",
+    ] {
+        assert!(text.contains(needle), "{needle}\n{text}");
+    }
+}
+
+#[test]
+fn a_branched_workflow_keeps_its_own_dependencies_contracts_and_ownership() {
+    let mut def = default_workflow(true);
+    // A second implementer on a disjoint folder, in parallel with the first, aborting on failure.
+    let mut ui = def
+        .stages
+        .iter()
+        .find(|s| s.id == "implement")
+        .unwrap()
+        .clone();
+    ui.id = "implement-ui".into();
+    ui.owns = strs(&["src/ui"]);
+    ui.outputs[0].name = "ui-diff".into();
+    ui.policy = StagePolicy {
+        max_attempts: 1,
+        max_repair_cycles: 0,
+        on_exhausted: OnExhausted::Abort,
+    };
+    for s in &mut def.stages {
+        match s.id.as_str() {
+            "implement" => s.owns = strs(&["src/core"]),
+            "test" => {
+                s.depends_on = strs(&["implement", "implement-ui"]);
+                s.inputs.push(Input {
+                    name: "ui-diff".into(),
+                    from: Some(OutputRef {
+                        stage: "implement-ui".into(),
+                        output: "ui-diff".into(),
+                    }),
+                    required: true,
+                });
+            }
+            "review" => s.depends_on.push("implement-ui".into()),
+            _ => {}
+        }
+    }
+    def.stages.push(ui);
+    let env = trusted_env();
+    let reg = claude_default();
+    let wf = validate(def, &reg, &env).unwrap_or_else(|v| panic!("{v:?}"));
+    let s = Settings::default();
+    let b = adapt(&request(&wf, &s, &reg, &env, Some(ExecutionPath::Fast))).unwrap();
+    let (core, ui, test) = (
+        stage(&b, "implement"),
+        stage(&b, "implement-ui"),
+        stage(&b, "test"),
+    );
+    assert_eq!(core.parallel_with, ["implement-ui"]);
+    assert_eq!(ui.parallel_with, ["implement"]);
+    assert_eq!(core.owns, ["src/core"]);
+    assert_eq!(ui.owns, ["src/ui"]);
+    assert_eq!(test.waits_for, ["implement", "implement-ui"]);
+    assert!(test.parallel_with.is_empty());
+    assert_eq!(ui.on_exhausted, OnExhausted::Abort);
+    assert_eq!(
+        (core.on_exhausted, core.max_attempts),
+        (OnExhausted::Escalate, 2)
+    );
+    let text = b.assignments();
+    for needle in [
+        "- implement (Coder): waits for explore; may run in parallel with implement-ui.",
+        "- implement-ui (Coder): waits for explore; may run in parallel with implement.",
+        "Owns only src/core: it must not write elsewhere.",
+        "Owns only src/ui: it must not write elsewhere.",
+        "ui-diff (from implement-ui.ui-diff, required)",
+        "at most 1 attempt(s) and 0 repair cycle(s); then abort the stage and report it",
+        "- test (Tester): waits for implement, implement-ui; nothing may run alongside it.",
+    ] {
+        assert!(text.contains(needle), "{needle}\n{text}");
+    }
+}
+
+#[test]
+fn models_are_configured_and_eligible_not_verified_unless_proven() {
+    let b = brief(None);
+    assert!(b.roles.iter().all(|r| !r.verified));
+    assert!(!b.review.as_ref().unwrap().verified);
+    let text = b.assignments();
+    assert!(text.contains("runtime availability not verified"));
+    assert!(text.contains("is not a verified runtime model"));
+    assert!(b.report().contains("Final reviewer: claude-opus-5-5 (configured and eligible; runtime availability not verified)"));
+    assert!(b
+        .guarantees
+        .iter()
+        .any(|g| g.policy.starts_with("Stage order") && g.level == Enforcement::Instructed));
+    assert!(b
+        .report()
+        .contains("Stage order, input and output contracts"));
+    assert!(text.contains("Never substitute another model for a bulk reader or the final reviewer"));
+    assert!(!text.contains("(verified available)"));
+    let g = b
+        .guarantees
+        .iter()
+        .find(|g| g.policy == "Model runtime availability")
+        .unwrap();
+    assert!(g.level < Enforcement::Enforced);
+    assert!(b.report().contains("Model runtime availability"));
+    // The production entry point has nothing to verify with, so it never claims availability.
+    let tmp = Tmp::new();
+    let prod = prepare(&Settings::default(), None, None, &tmp.dirs(vec![])).unwrap();
+    assert!(prod.roles.iter().all(|r| !r.verified) && !prod.review.unwrap().verified);
+    // A model proven available is reported as such, and only that model.
+    let env = trusted_env();
+    let reg = claude_default();
+    let wf = validate(default_workflow(true), &reg, &env).unwrap();
+    let mut s = Settings::default();
+    s.coder.model = SONNET.into();
+    let proven: BTreeSet<String> = [HAIKU.to_string(), OPUS.to_string()].into();
+    let mut r = request(&wf, &s, &reg, &env, None);
+    r.verified = &proven;
+    let b = adapt(&r).unwrap();
+    assert!(role(&b, "explorer").verified && b.review.as_ref().unwrap().verified);
+    assert!(b.roles.iter().all(|r| r.verified == (r.model == HAIKU)));
+    let text = b.assignments();
+    assert!(text.contains("(verified available)"));
+    // Partly verified: the caveat names only the unverified ones.
+    assert!(text.contains("not marked verified available above"));
+    assert!(!text.contains("none is a verified"));
+    assert!(b
+        .report()
+        .contains("Explorer: claude-haiku-5-5 (verified available)"));
+}
+
+#[test]
+fn an_unavailable_cheapest_reader_or_strongest_reviewer_is_never_swapped() {
+    let env = trusted_env();
+    let s = Settings::default();
+    for (model, code) in [(HAIKU, Code::ModelPolicy), (OPUS, Code::Review)] {
+        let mut reg = claude_default();
+        reg.set_available(model, false);
+        let wf = validate(default_workflow(true), &reg, &env).unwrap();
+        let err = adapt(&request(&wf, &s, &reg, &env, None)).unwrap_err();
+        assert!(codes(&err).contains(&code), "{model}: {err:?}");
+    }
+    // A model that is unavailable is not verified even if something claims it is.
+    let mut reg = claude_default();
+    reg.set_available(HAIKU, false);
+    let wf = validate(default_workflow(true), &reg, &env).unwrap();
+    let proven: BTreeSet<String> = [HAIKU.to_string(), SONNET.to_string()].into();
+    let auth = Authorization {
+        model: SONNET.into(),
+    };
+    let mut r = request(&wf, &s, &reg, &env, None);
+    r.verified = &proven;
+    r.bulk_auth = Some(&auth);
+    let b = adapt(&r).unwrap();
+    // Only the explicit authorization moved the readers, and it is still labelled so.
+    assert_eq!(role(&b, "explorer").model, SONNET);
+    assert!(role(&b, "explorer").why.contains("explicitly authorized"));
+    assert!(!is_verified(&r, HAIKU));
+}
+
+#[test]
+fn bulk_roles_with_different_cheapest_models_keep_the_cheaper_unnamed_default() {
+    // Haiku cannot browse, so the Researcher's cheapest capable model is Sonnet; the Explorer's is Haiku.
+    let mut reg = claude_default();
+    reg.models[0].tools.remove("web");
+    let b = brief_with(&Settings::default(), &reg, None).unwrap();
+    assert_eq!(role(&b, "explorer").model, HAIKU);
+    assert_eq!(role(&b, "researcher").model, SONNET);
+    // Unnamed work is not moved to the dearer model.
+    assert_eq!(b.plan.subagent_model, HAIKU);
+    assert!(b
+        .notices
+        .iter()
+        .any(|n| n.contains("cannot match them all")));
+    let text = b.assignments();
+    assert!(text.contains("Unnamed subagents run on claude-haiku-5-5"));
+    assert!(text.contains(
+        "cannot match every bulk role: Researcher (claude-sonnet-5-5) use a different model"
+    ));
+    assert!(text.contains("only as named teammates with exactly that model"));
+    assert!(!text.contains("Explorer (claude-haiku-5-5) need"));
+    let g = b
+        .guarantees
+        .iter()
+        .find(|g| g.policy.starts_with("Unnamed"))
+        .unwrap();
+    assert!(g
+        .note
+        .contains("cannot match bulk roles that resolve to different models"));
+    assert_eq!(
+        crate::pty::claude_team_env(&b.plan)[1],
+        ("CLAUDE_CODE_SUBAGENT_MODEL", HAIKU.to_string())
+    );
+    // The dearer model becomes the default only when every bulk role resolves to it.
+    let mut reg = claude_default();
+    reg.models[0].tools.remove("web");
+    reg.models[0].tools.remove("search");
+    let b = brief_with(&Settings::default(), &reg, None).unwrap();
+    assert!(b.roles.iter().filter(|r| r.bulk).all(|r| r.model == SONNET));
+    assert_eq!(b.plan.subagent_model, SONNET);
+    assert!(!b.assignments().contains("cannot match every bulk role"));
 }

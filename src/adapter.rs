@@ -15,8 +15,8 @@ use crate::capability::{RolePlan, ADVISORS};
 use crate::plugins::{self, Plugin, Store};
 use crate::roles::{Role, Settings};
 use crate::workflow::contract::{
-    self, BackendProfile, ExecutionPath, PluginRef, RoleClass, Stage, ValidatedWorkflow,
-    WorkflowDef,
+    self, BackendProfile, ExecutionPath, OnExhausted, PluginRef, RoleClass, Stage,
+    ValidatedWorkflow, WorkflowDef,
 };
 use crate::workflow::registry::{
     self, Authorization, BulkSelection, Escalation, Permission, Registry,
@@ -24,7 +24,7 @@ use crate::workflow::registry::{
 use crate::workflow::route::{self, Complexity, Resolved, Risk, RouteDecision, TaskProfile};
 use crate::workflow::{Code, Enforcement, Violation};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -38,6 +38,10 @@ pub struct Request<'a> {
     pub workflow: &'a ValidatedWorkflow,
     pub settings: &'a Settings,
     pub registry: &'a Registry,
+    /// Registry ids whose availability to the running Claude Code was positively verified. The
+    /// registry's `available` flag only says a model is not known to be unavailable; a model
+    /// absent from here is configured and eligible but unverified, and is reported that way.
+    pub verified: &'a BTreeSet<String>,
     pub plugins: &'a [Plugin],
     pub trust: &'a Store,
     pub task: TaskProfile,
@@ -80,6 +84,29 @@ pub struct RoleBrief {
     pub mcp: Vec<String>,
     pub bulk: bool,
     pub attempts: u8,
+    /// Whether `model` was verified as available to the running Claude Code.
+    pub verified: bool,
+}
+
+/// One active stage as the validated workflow defines it. Everything here is read from the
+/// stage, never mapped by name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageBrief {
+    pub id: String,
+    pub role: String,
+    /// Stages that must finish first on this path (`depends_on` plus optional ones that run).
+    pub waits_for: Vec<String>,
+    /// Active stages with no ordering to this one, either way: they may run at the same time.
+    pub parallel_with: Vec<String>,
+    /// (name, `stage.output` it comes from or `None` when the run supplies it, required).
+    pub inputs: Vec<(String, Option<String>, bool)>,
+    /// (name, artifact kind).
+    pub outputs: Vec<(String, String)>,
+    /// Workspace paths the stage may write. Empty: none.
+    pub owns: Vec<String>,
+    pub max_attempts: u8,
+    pub max_repair_cycles: u8,
+    pub on_exhausted: OnExhausted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +115,8 @@ pub struct ReviewBrief {
     pub model: String,
     pub strongest: String,
     pub authorized_downgrade: bool,
+    /// Whether `model` was verified as available to the running Claude Code.
+    pub verified: bool,
     /// The `--advisor` value that reaches it. `None`: the advisor is off and review ends BLOCKED.
     pub advisor: Option<String>,
     pub max_inspections: u8,
@@ -109,6 +138,8 @@ pub struct Brief {
     pub decision: RouteDecision,
     /// (stage, role) in dependency order for the chosen path.
     pub stages: Vec<(String, String)>,
+    /// The same stages with their dependencies, contracts, ownership and retry bounds.
+    pub flow: Vec<StageBrief>,
     pub roles: Vec<RoleBrief>,
     pub review: Option<ReviewBrief>,
     pub advisor_skill: Option<SkillUse>,
@@ -149,6 +180,18 @@ impl Brief {
         for g in &self.guarantees {
             let _ = writeln!(t, "  [{}] {}: {}", g.level.label(), g.policy, g.note);
         }
+        t.push_str("\nSelected models:\n");
+        for r in &self.roles {
+            let _ = writeln!(t, "  {}: {}{}", r.label, r.model, availability(r.verified));
+        }
+        if let Some(r) = &self.review {
+            let _ = writeln!(
+                t,
+                "  Final reviewer: {}{}",
+                r.model,
+                availability(r.verified)
+            );
+        }
         if !self.conflicts.is_empty() {
             t.push_str("\nSaved settings that conflict with workflow policy:\n");
             for c in &self.conflicts {
@@ -167,7 +210,7 @@ impl Brief {
     /// The role section of the lead's instructions. It replaces the fixed role list.
     pub fn assignments(&self) -> String {
         let mut t = format!(
-            "The lead session runs on {}. Workflow '{}', {} path ({}). Stages in order: {}.\n",
+            "The lead session runs on {}. Workflow '{}', {} path ({}). Stages in dependency order: {}.\n",
             self.plan.lead_model,
             self.workflow,
             self.decision.path.label(),
@@ -178,6 +221,7 @@ impl Brief {
                 .collect::<Vec<_>>()
                 .join(" > ")
         );
+        t.push_str(&self.flow_text());
         t.push_str("Role assignments for named teammates. Claude Code does not apply a teammate's model, tools or permission mode, so state them in each teammate's prompt; Agentree cannot confirm they were followed:\n");
         for r in &self.roles {
             let _ = write!(
@@ -191,9 +235,10 @@ impl Brief {
             let tools: Vec<&str> = r.tools.iter().map(|c| claude_tools(c)).collect();
             let _ = writeln!(
                 t,
-                "\n  Stages: {}. Model: {}. Access: {}; capabilities {} (Claude tools: {}).",
+                "\n  Stages: {}. Model: {}{}. Access: {}; capabilities {} (Claude tools: {}).",
                 r.stages.join(", "),
                 r.why,
+                availability(r.verified),
                 if r.access == Permission::Edit {
                     "may edit"
                 } else {
@@ -206,6 +251,11 @@ impl Brief {
                 let _ = writeln!(t, "  {}", skill_line("Skill", s, true));
             }
         }
+        if !self.roles.iter().all(|r| r.verified)
+            || self.review.as_ref().is_some_and(|r| !r.verified)
+        {
+            t.push_str("\nModel availability: every model not marked verified available above is only configured and eligible in Agentree's registry: Agentree could not confirm that your Claude Code can run it, so it is not a verified runtime model. If Claude Code rejects or cannot start a listed model, stop, write the attention file and ask the human. Never substitute another model for a bulk reader or the final reviewer on your own.\n");
+        }
         if self.roles.iter().any(|r| r.bulk) {
             let bulk: Vec<&str> = self
                 .roles
@@ -216,8 +266,9 @@ impl Brief {
             let attempts = self.roles.iter().filter(|r| r.bulk).map(|r| r.attempts);
             let _ = write!(
                 t,
-                "\nBulk reading: all high-token work (repository exploration, large files, documentation research, log examination, scanning, evidence extraction) goes to {} on the lowest-cost capable model listed above. Do not do it yourself on the lead model and do not use unnamed subagents for it. When you spawn a bulk reader, use exactly the listed model and pass no other model override. Teammates return compact evidence (claim, file, line range, source hash), not file contents. {} A failed read may be retried at most {} more time(s), then ask the human. Never move bulk reading to a more expensive model on your own: if the listed model cannot do the work, write the attention file and ask the human to authorize a named model. Claude Code cannot enforce this delegation.\n",
+                "\nBulk reading: all high-token work (repository exploration, large files, documentation research, log examination, scanning, evidence extraction) goes to {} on the lowest-cost capable model listed above. Do not do it yourself on the lead model and do not use unnamed subagents for it. {}When you spawn a bulk reader, use exactly the listed model and pass no other model override. Teammates return compact evidence (claim, file, line range, source hash), not file contents. {} A failed read may be retried at most {} more time(s), then ask the human. Never move bulk reading to a more expensive model on your own: if the listed model cannot do the work, write the attention file and ask the human to authorize a named model. Claude Code cannot enforce this delegation.\n",
                 bulk.join(" and "),
+                self.unnamed_text(),
                 self.chunking,
                 attempts.min().unwrap_or(1).saturating_sub(1)
             );
@@ -257,10 +308,104 @@ impl Brief {
         t.trim_end().to_string()
     }
 
+    /// The dependency graph, input and output contracts, ownership and retry bounds of the
+    /// active stages, as instructions to the lead.
+    fn flow_text(&self) -> String {
+        let mut t = String::from("Stage flow, taken from the validated workflow. Claude Code does not schedule, gate or sandbox these: they are instructions to you, and Agentree cannot confirm they were followed. A stage starts only when every stage it waits for has finished and delivered its outputs; stages with no ordering between them may run in parallel. Hand each stage only the inputs named for it, from the source named; the objective and acceptance criteria come from the run.\n");
+        for s in &self.flow {
+            let _ = write!(t, "- {} ({}): ", s.id, s.role);
+            if s.waits_for.is_empty() {
+                t.push_str("starts immediately");
+            } else {
+                let _ = write!(t, "waits for {}", s.waits_for.join(", "));
+            }
+            if s.parallel_with.is_empty() {
+                t.push_str("; nothing may run alongside it");
+            } else {
+                let _ = write!(
+                    t,
+                    "; may run in parallel with {}",
+                    s.parallel_with.join(", ")
+                );
+            }
+            t.push_str(".\n  Inputs: ");
+            let inputs: Vec<String> = s
+                .inputs
+                .iter()
+                .map(|(n, from, req)| {
+                    format!(
+                        "{n} ({}, {})",
+                        from.as_deref()
+                            .map_or("supplied by the run".to_string(), |f| format!("from {f}")),
+                        if *req { "required" } else { "optional" }
+                    )
+                })
+                .collect();
+            t.push_str(&if inputs.is_empty() {
+                "none".into()
+            } else {
+                inputs.join("; ")
+            });
+            let outputs: Vec<String> = s
+                .outputs
+                .iter()
+                .map(|(n, k)| format!("{n} ({k})"))
+                .collect();
+            let _ = write!(t, ". Outputs: {}. ", outputs.join("; "));
+            match s.owns.as_slice() {
+                [] => t.push_str("Owns no workspace paths: it must not write files."),
+                [p] if p == "." => t.push_str(
+                    "Owns the whole workspace: no other stage writes to it at the same time.",
+                ),
+                p => {
+                    let _ = write!(
+                        t,
+                        "Owns only {}: it must not write elsewhere.",
+                        p.join(", ")
+                    );
+                }
+            }
+            let _ = writeln!(
+                t,
+                " Bounded: at most {} attempt(s) and {} repair cycle(s); then {}.",
+                s.max_attempts,
+                s.max_repair_cycles,
+                match s.on_exhausted {
+                    OnExhausted::Escalate => "stop and ask the human through the attention file",
+                    OnExhausted::Abort => "abort the stage and report it; do not continue",
+                }
+            );
+        }
+        t
+    }
+
+    /// How unnamed subagents are configured, and why some bulk work must not use them.
+    fn unnamed_text(&self) -> String {
+        let mut t = format!(
+            "Unnamed subagents run on {} (CLAUDE_CODE_SUBAGENT_MODEL), one default for every role. ",
+            self.plan.subagent_model
+        );
+        let apart: Vec<String> = self
+            .roles
+            .iter()
+            .filter(|r| r.bulk && r.model != self.plan.subagent_model)
+            .map(|r| format!("{} ({})", r.label, r.model))
+            .collect();
+        if !apart.is_empty() {
+            let _ = write!(
+                t,
+                "That default cannot match every bulk role: {} use a different model, so spawn them only as named teammates with exactly that model. ",
+                apart.join(", ")
+            );
+        }
+        t
+    }
+
     fn review_text(&self, r: &ReviewBrief) -> String {
         let mut t = format!(
-            "\nFinal review: every change to code, on every path, ends with an independent review by the strongest eligible model in the model registry, {}. ",
-            r.model
+            "\nFinal review: every change to code, on every path, ends with an independent review by the strongest eligible model in the model registry, {}{}. ",
+            r.model,
+            availability(r.verified)
         );
         if r.authorized_downgrade {
             let _ = write!(
@@ -286,6 +431,14 @@ impl Brief {
         }
         t.push('\n');
         t
+    }
+}
+
+fn availability(verified: bool) -> &'static str {
+    if verified {
+        " (verified available)"
+    } else {
+        " (configured and eligible; runtime availability not verified)"
     }
 }
 
@@ -423,6 +576,71 @@ fn describe_bulk(sel: &BulkSelection) -> String {
     }
 }
 
+fn is_verified(req: &Request, model: &str) -> bool {
+    req.registry
+        .get(model)
+        .is_some_and(|m| m.available && req.verified.contains(&m.id))
+}
+
+/// Each active stage with what it waits for, what runs beside it, its contracts, ownership and
+/// retry bounds. `on_path` is in dependency order, so every dependency is seen before its dependants.
+fn flow(wf: &ValidatedWorkflow, path: ExecutionPath, on_path: &[&Stage]) -> Vec<StageBrief> {
+    let active: BTreeSet<&str> = on_path.iter().map(|s| s.id.as_str()).collect();
+    let mut before: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for s in on_path {
+        let mut all = BTreeSet::new();
+        for w in wf.waits_for(path, s) {
+            all.insert(w);
+            all.extend(before.get(w).into_iter().flatten().copied());
+        }
+        before.insert(s.id.as_str(), all);
+    }
+    let ordered = |a: &str, b: &str| before[a].contains(b) || before[b].contains(a);
+    on_path
+        .iter()
+        .map(|s| StageBrief {
+            id: s.id.clone(),
+            role: label_of(&s.role),
+            waits_for: wf
+                .waits_for(path, s)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            parallel_with: active
+                .iter()
+                .filter(|o| **o != s.id && !ordered(&s.id, o))
+                .map(|o| o.to_string())
+                .collect(),
+            // An optional input from a stage that is not on this path simply does not exist.
+            inputs: s
+                .inputs
+                .iter()
+                .filter(|i| {
+                    i.from
+                        .as_ref()
+                        .is_none_or(|f| active.contains(f.stage.as_str()))
+                })
+                .map(|i| {
+                    (
+                        i.name.clone(),
+                        i.from.as_ref().map(|f| format!("{}.{}", f.stage, f.output)),
+                        i.required,
+                    )
+                })
+                .collect(),
+            outputs: s
+                .outputs
+                .iter()
+                .map(|o| (o.name.clone(), format!("{:?}", o.kind).to_lowercase()))
+                .collect(),
+            owns: s.owns.clone(),
+            max_attempts: s.policy.max_attempts,
+            max_repair_cycles: s.policy.max_repair_cycles,
+            on_exhausted: s.policy.on_exhausted,
+        })
+        .collect()
+}
+
 /// Builds the launch brief, or every reason the launch must not happen.
 pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
     let wf = req.workflow;
@@ -502,6 +720,7 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
                 continue;
             }
         };
+        let verified = is_verified(req, &model);
         let saved = setting_role.map(|r| req.settings.get(r));
         if let Some(s) = saved.filter(|s| {
             req.registry.get(&s.model).map(|m| &m.id) != req.registry.get(&model).map(|m| &m.id)
@@ -564,19 +783,29 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
             mcp,
             bulk: rd.class == RoleClass::BulkRead,
             attempts: first.policy.max_attempts,
+            verified,
         });
     }
-    // Unnamed subagents have one model in Claude Code. Bulk reading can land there, so it takes
-    // the dearest bulk model (capable of every bulk role) instead of the Coder's.
-    let cost = |m: &String| req.registry.get(m).map_or(0, |e| e.cost);
-    if let Some(model) = bulk_models.iter().max_by_key(|m| cost(m)) {
+    // Unnamed subagents have one model in Claude Code. Take the cheapest bulk model so unnamed
+    // work never costs more than a bulk role's own lowest-cost choice. When the bulk roles'
+    // models differ, one variable cannot match them all: `Brief::unnamed_text` then tells the
+    // lead to use named teammates for the others.
+    let cost = |m: &String| req.registry.get(m).map_or(u32::MAX, |e| e.cost);
+    if let Some(model) = bulk_models.iter().min_by_key(|m| (cost(m), m.as_str())) {
         if &plan.subagent_model != model {
             notices.push(format!(
-                "Unnamed subagents run on {model} (lowest-cost capable model), not on the Coder's {}",
+                "Unnamed subagents run on {model} (lowest-cost bulk model), not on the Coder's {}",
                 plan.subagent_model
             ));
         }
         plan.subagent_model = model.clone();
+        if bulk_models.iter().any(|m| m != model) {
+            let distinct: BTreeSet<&str> = bulk_models.iter().map(String::as_str).collect();
+            notices.push(format!(
+                "Bulk roles resolve to different models ({}); one unnamed-subagent default cannot match them all, so those roles must run as named teammates with their own model",
+                distinct.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
     }
 
     // The final review: strongest eligible model, never silently weaker.
@@ -603,6 +832,7 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
                         plan.advisor = Some(alias);
                     }
                     review = Some(ReviewBrief {
+                        verified: is_verified(req, &sel.model),
                         model: sel.model,
                         strongest: sel.strongest,
                         authorized_downgrade: sel.authorized_downgrade,
@@ -672,6 +902,7 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
     if !errors.is_empty() {
         return Err(errors);
     }
+    let flow = flow(wf, decision.path, &on_path);
     Ok(Brief {
         workflow: def.name.clone(),
         plan,
@@ -680,6 +911,7 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
             .iter()
             .map(|s| (s.id.clone(), label_of(&s.role)))
             .collect(),
+        flow,
         roles,
         review,
         advisor_skill,
@@ -707,10 +939,12 @@ fn guarantees(b: &BackendProfile, plan: &RolePlan, roles: &[RoleBrief]) -> Vec<G
             policy: "Unnamed-subagent model",
             level: Enforcement::Instructed,
             note: format!(
-                "CLAUDE_CODE_SUBAGENT_MODEL={} is set at launch as the default; a per-call model or an agent definition's model overrides it, it does not cover named teammates, and Agentree has not observed it in a live session",
+                "CLAUDE_CODE_SUBAGENT_MODEL={} is set at launch as the default (the cheapest bulk model); one default cannot match bulk roles that resolve to different models, so those must be named teammates. A per-call model or an agent definition's model overrides it, it does not cover named teammates, and Agentree has not observed it in a live session",
                 plan.subagent_model
             ),
         },
+        g("Stage order, input and output contracts, path ownership and retry bounds", Enforcement::Instructed, "written into the lead's instructions from the validated workflow; Claude Code does not schedule, gate or sandbox stages, and Agentree cannot confirm they were followed"),
+        g("Model runtime availability", Enforcement::Instructed, "models are configured and eligible in the registry; Agentree cannot verify that your Claude Code can run them before launch, and the lead is told to stop and ask rather than substitute"),
         g("Teammate models (cheapest bulk reader)", b.role_model, "written into the lead's instructions; Claude Code does not apply a model per named teammate"),
         g("Teammate tools and permission modes", b.role_permission, "written into the lead's instructions; not applied per teammate"),
         g("Bulk reading delegated away from the lead", b.coordinator_bulk_reading, "the lead is asked to delegate; it can still read on its own model"),
@@ -890,6 +1124,10 @@ pub fn prepare(
         workflow: &workflow,
         settings,
         registry: &registry,
+        // ponytail: Claude Code has no model-listing command and the probes in `capability` do
+        // not start a session, so nothing can be verified before launch. Every model is
+        // reported as configured and unverified; feed ids here if a real check ever exists.
+        verified: &BTreeSet::new(),
         plugins: &env.plugins,
         trust: &env.trust,
         task: task_for(path),
