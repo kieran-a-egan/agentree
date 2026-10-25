@@ -47,3 +47,7 @@ agentree --instructions C:\path\to\project
 ```
 
 Prints each file found, the settings seen, how `AGENTS.md` loads and any text difference. A missing or inaccessible project folder is an error with a nonzero exit status; file problems are printed as `Problem:` lines. At launch the status bar shows a line when attention is needed, and every launch writes the same text to `instructions-resolved.txt` in the run folder next to `instructions.txt`. If the project folder cannot be resolved at launch, the launch continues without a note and the reason is recorded there. See [`examples/instructions`](../examples/instructions) for a `CLAUDE.md` that imports `AGENTS.md`.
+
+### Run manifest
+
+The launch's decision is also recorded in `run-manifest.json` (see [Run provenance](PROVENANCE.md)). There, the `agents_md` values `import_syntax`, `native_configured` and `requested`, and the dispositions `identical_to_claude_md`, `import_syntax_detected`, `native_load_configured` and `lead_read_requested`, describe import syntax, settings, text identity or the prompt's request only. None is an observation that Claude Code loaded the file or that the lead read it. `claude_ingestion` and `lead_read` are always `not_observed`.

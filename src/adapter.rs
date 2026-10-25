@@ -61,8 +61,63 @@ pub struct SkillUse {
     pub version: Option<String>,
     pub name: String,
     pub file: PathBuf,
-    /// First characters of the plugin fingerprint that was trusted.
+    /// The plugin's full content fingerprint (SHA-256) that was trusted.
     pub fingerprint: String,
+    /// The `SKILL.md` path inside the plugin, `/`-separated.
+    pub source: String,
+}
+
+/// Why a skill or MCP server the workflow names is not available to this launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Why {
+    /// The plugin is missing, or was rejected when loaded.
+    NotLoaded,
+    /// More than one loaded plugin has the name, so none is used.
+    Ambiguous,
+    /// No trust is saved for the plugin's folder (never trusted, or revoked).
+    Untrusted,
+    /// Trusted before, but the files differ now or cannot be read.
+    Changed,
+    /// The plugin is trusted but does not have the named skill or server.
+    NoSuchItem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ItemKind {
+    Skill,
+    Mcp,
+}
+
+/// A skill or MCP server that was asked for and not offered. Never treated as activated.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unavailable {
+    /// The workflow role id, or `advisor`.
+    pub role: String,
+    pub kind: ItemKind,
+    pub plugin: String,
+    pub name: String,
+    pub why: Why,
+}
+
+/// A plugin that passed `Store::activate` for something this launch offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivatedPlugin {
+    pub name: String,
+    pub version: Option<String>,
+    /// Full content fingerprint (SHA-256) that was trusted.
+    pub fingerprint: String,
+}
+
+/// An activation failure: the reason as data, and the message the human sees.
+struct Gone {
+    why: Why,
+    text: String,
+}
+
+impl std::fmt::Display for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +148,8 @@ pub struct RoleBrief {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageBrief {
     pub id: String,
+    /// The workflow role id.
+    pub role_id: String,
     pub role: String,
     /// Stages that must finish first on this path (`depends_on` plus optional ones that run).
     pub waits_for: Vec<String>,
@@ -111,6 +168,8 @@ pub struct StageBrief {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReviewBrief {
+    /// The workflow role id of the review stage.
+    pub role: String,
     /// Registry id of the reviewer.
     pub model: String,
     pub strongest: String,
@@ -143,6 +202,10 @@ pub struct Brief {
     pub roles: Vec<RoleBrief>,
     pub review: Option<ReviewBrief>,
     pub advisor_skill: Option<SkillUse>,
+    /// Skills and MCP servers the workflow named that were not offered, with the reason.
+    pub unavailable: Vec<Unavailable>,
+    /// Plugins that passed the trust gate for a skill or MCP server this brief names.
+    pub activated: Vec<ActivatedPlugin>,
     /// Saved settings that contradict a mandatory policy.
     pub conflicts: Vec<Violation>,
     /// What the adapter changed or could not load, for the human.
@@ -455,7 +518,7 @@ fn skill_line(what: &str, s: &SkillUse, teammate: bool) -> String {
         s.name,
         s.plugin,
         s.version.as_deref().unwrap_or("unversioned"),
-        s.fingerprint,
+        s.fingerprint.chars().take(12).collect::<String>(),
     )
 }
 
@@ -492,16 +555,21 @@ fn activate<'a>(
     r: &PluginRef,
     all: &'a [Plugin],
     trust: &Store,
-) -> Result<(&'a Plugin, plugins::Activation<'a>), String> {
+) -> Result<(&'a Plugin, plugins::Activation<'a>), Gone> {
+    let gone = |why, text| Gone { why, text };
     let named: Vec<&Plugin> = all.iter().filter(|p| p.manifest.name == r.plugin).collect();
     let plugin = match named.as_slice() {
         [p] => *p,
-        [] => return Err(format!("plugin '{}' is not loaded", r.plugin)),
+        [] => {
+            return Err(gone(
+                Why::NotLoaded,
+                format!("plugin '{}' is not loaded", r.plugin),
+            ))
+        }
         many => {
-            return Err(format!(
-                "{} loaded plugins are named '{}'",
-                many.len(),
-                r.plugin
+            return Err(gone(
+                Why::Ambiguous,
+                format!("{} loaded plugins are named '{}'", many.len(), r.plugin),
             ))
         }
     };
@@ -509,43 +577,61 @@ fn activate<'a>(
         .activate(plugin)
         .map(|a| (plugin, a))
         .ok_or_else(|| {
-            format!(
-                "plugin '{}' is {}. Review it, then trust it with: agentree --plugin \"{}\" --plugin-trust",
-                r.plugin,
-                trust.state(plugin).label(),
-                plugin.root.display()
+            let state = trust.state(plugin);
+            gone(
+                if state == plugins::State::Untrusted {
+                    Why::Untrusted
+                } else {
+                    Why::Changed
+                },
+                format!(
+                    "plugin '{}' is {}. Review it, then trust it with: agentree --plugin \"{}\" --plugin-trust",
+                    r.plugin,
+                    state.label(),
+                    plugin.root.display()
+                ),
             )
         })
 }
 
-fn skill_use(r: &PluginRef, all: &[Plugin], trust: &Store) -> Result<SkillUse, String> {
+fn skill_use(r: &PluginRef, all: &[Plugin], trust: &Store) -> Result<SkillUse, Gone> {
     let (plugin, active) = activate(r, all, trust)?;
     let skill = active
         .skills
         .iter()
         .find(|s| s.name == r.name)
-        .ok_or_else(|| format!("trusted plugin '{}' has no skill '{}'", r.plugin, r.name))?;
+        .ok_or_else(|| Gone {
+            why: Why::NoSuchItem,
+            text: format!("trusted plugin '{}' has no skill '{}'", r.plugin, r.name),
+        })?;
+    let file = skill.dir.join("SKILL.md");
+    let source = file.strip_prefix(&plugin.root).map_or_else(
+        |_| format!("skills/{}/SKILL.md", skill.name),
+        |p| p.to_string_lossy().replace('\\', "/"),
+    );
     Ok(SkillUse {
         plugin: plugin.manifest.name.clone(),
         version: plugin.manifest.version.clone(),
         name: skill.name.clone(),
-        file: skill.dir.join("SKILL.md"),
-        fingerprint: plugin.fingerprint.chars().take(12).collect(),
+        file,
+        fingerprint: plugin.fingerprint.clone(),
+        source,
     })
 }
 
-fn mcp_names(r: &PluginRef, all: &[Plugin], trust: &Store) -> Result<String, String> {
+fn mcp_names(r: &PluginRef, all: &[Plugin], trust: &Store) -> Result<String, Gone> {
     let (_, active) = activate(r, all, trust)?;
     active
         .mcp
         .iter()
         .find(|m| m.name == r.name)
         .map(|m| format!("{}/{}", r.plugin, m.name))
-        .ok_or_else(|| {
-            format!(
+        .ok_or_else(|| Gone {
+            why: Why::NoSuchItem,
+            text: format!(
                 "trusted plugin '{}' has no MCP server '{}'",
                 r.plugin, r.name
-            )
+            ),
         })
 }
 
@@ -600,6 +686,7 @@ fn flow(wf: &ValidatedWorkflow, path: ExecutionPath, on_path: &[&Stage]) -> Vec<
         .iter()
         .map(|s| StageBrief {
             id: s.id.clone(),
+            role_id: s.role.clone(),
             role: label_of(&s.role),
             waits_for: wf
                 .waits_for(path, s)
@@ -652,14 +739,26 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
     let (mut roles, mut bulk_models): (Vec<RoleBrief>, Vec<String>) = (Vec::new(), Vec::new());
     let mut chunking =
         "Chunking is not permitted: if the input does not fit, ask the human.".to_string();
-    let skill_for = |label: &str, r: &Option<PluginRef>, notices: &mut Vec<String>| {
+    let mut unavailable: Vec<Unavailable> = Vec::new();
+    let skill_for = |role: &str,
+                     label: &str,
+                     r: &Option<PluginRef>,
+                     notices: &mut Vec<String>,
+                     unavailable: &mut Vec<Unavailable>| {
         let r = r.as_ref()?;
         skill_use(r, req.plugins, req.trust)
-            .map_err(|why| {
+            .map_err(|gone| {
                 notices.push(format!(
-                    "{label}: skill {}/{} not loaded: {why}",
+                    "{label}: skill {}/{} not loaded: {gone}",
                     r.plugin, r.name
-                ))
+                ));
+                unavailable.push(Unavailable {
+                    role: role.into(),
+                    kind: ItemKind::Skill,
+                    plugin: r.plugin.clone(),
+                    name: r.name.clone(),
+                    why: gone.why,
+                });
             })
             .ok()
     };
@@ -761,12 +860,21 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
         for m in &rd.mcp {
             match mcp_names(m, req.plugins, req.trust) {
                 Ok(n) => mcp.push(n),
-                Err(why) => notices.push(format!(
-                    "{}: MCP server {}/{} not available: {why}",
-                    label_of(&rd.id),
-                    m.plugin,
-                    m.name
-                )),
+                Err(gone) => {
+                    notices.push(format!(
+                        "{}: MCP server {}/{} not available: {gone}",
+                        label_of(&rd.id),
+                        m.plugin,
+                        m.name
+                    ));
+                    unavailable.push(Unavailable {
+                        role: rd.id.clone(),
+                        kind: ItemKind::Mcp,
+                        plugin: m.plugin.clone(),
+                        name: m.name.clone(),
+                        why: gone.why,
+                    });
+                }
             }
         }
         roles.push(RoleBrief {
@@ -779,7 +887,13 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
             access: rd.permission,
             tools: rd.tools.clone(),
             mode,
-            skill: skill_for(&label_of(&rd.id), &rd.skill, &mut notices),
+            skill: skill_for(
+                &rd.id,
+                &label_of(&rd.id),
+                &rd.skill,
+                &mut notices,
+                &mut unavailable,
+            ),
             mcp,
             bulk: rd.class == RoleClass::BulkRead,
             attempts: first.policy.max_attempts,
@@ -832,6 +946,7 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
                         plan.advisor = Some(alias);
                     }
                     review = Some(ReviewBrief {
+                        role: rd.id.clone(),
                         verified: is_verified(req, &sel.model),
                         model: sel.model,
                         strongest: sel.strongest,
@@ -842,7 +957,13 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
                             .inspection
                             .as_ref()
                             .map_or("a bulk reader".into(), |i| label_of(&i.reader_role)),
-                        skill: skill_for("Final reviewer", &rd.skill, &mut notices),
+                        skill: skill_for(
+                            &rd.id,
+                            "Final reviewer",
+                            &rd.skill,
+                            &mut notices,
+                            &mut unavailable,
+                        ),
                     });
                 }
             },
@@ -869,8 +990,15 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
             name: name.into(),
         };
         skill_use(&r, req.plugins, req.trust)
-            .map_err(|why| {
-                notices.push(format!("Advisor: skill {plugin}/{name} not loaded: {why}"))
+            .map_err(|gone| {
+                notices.push(format!("Advisor: skill {plugin}/{name} not loaded: {gone}"));
+                unavailable.push(Unavailable {
+                    role: "advisor".into(),
+                    kind: ItemKind::Skill,
+                    plugin: plugin.into(),
+                    name: name.into(),
+                    why: gone.why,
+                });
             })
             .ok()
     });
@@ -903,6 +1031,32 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
         return Err(errors);
     }
     let flow = flow(wf, decision.path, &on_path);
+    // Plugins that backed a skill or MCP server above, taken from the loaded and gate-checked
+    // plugin; nothing is re-read from disk here.
+    let mut used: BTreeSet<&str> = BTreeSet::new();
+    for s in roles
+        .iter()
+        .filter_map(|r| r.skill.as_ref())
+        .chain(review.iter().filter_map(|r| r.skill.as_ref()))
+        .chain(advisor_skill.iter())
+    {
+        used.insert(&s.plugin);
+    }
+    for m in roles.iter().flat_map(|r| &r.mcp) {
+        used.extend(m.split_once('/').map(|(p, _)| p));
+    }
+    let activated = req
+        .plugins
+        .iter()
+        .filter(|p| used.contains(p.manifest.name.as_str()))
+        .map(|p| ActivatedPlugin {
+            name: p.manifest.name.clone(),
+            version: p.manifest.version.clone(),
+            fingerprint: p.fingerprint.clone(),
+        })
+        .collect();
+    unavailable.sort();
+    unavailable.dedup();
     Ok(Brief {
         workflow: def.name.clone(),
         plan,
@@ -915,6 +1069,8 @@ pub fn adapt(req: &Request) -> Result<Brief, Vec<Violation>> {
         roles,
         review,
         advisor_skill,
+        unavailable,
+        activated,
         conflicts,
         notices,
         guarantees,
@@ -1101,6 +1257,7 @@ pub fn prepare(
     let registry = registry::claude_default();
     let env = environment(dirs);
     let mut notices = env.notices.clone();
+    let mut fallback: Vec<Unavailable> = Vec::new();
     let workflow = match file {
         Some(file) => {
             let text = fs::read_to_string(file)
@@ -1114,6 +1271,19 @@ pub fn prepare(
             Ok(w) => w,
             Err(v) if v.iter().all(|x| x.code == Code::Plugin) => {
                 notices.extend(v.iter().map(|x| format!("Skills not loaded: {x}")));
+                for rd in contract::default_workflow(true).roles {
+                    if let Some(r) = &rd.skill {
+                        if let Err(gone) = activate(r, &env.plugins, &env.trust) {
+                            fallback.push(Unavailable {
+                                role: rd.id.clone(),
+                                kind: ItemKind::Skill,
+                                plugin: r.plugin.clone(),
+                                name: r.name.clone(),
+                                why: gone.why,
+                            });
+                        }
+                    }
+                }
                 validate(contract::default_workflow(false), &registry, &env)
                     .map_err(|v| format!("The built-in workflow is not valid: {}", join(&v)))?
             }
@@ -1139,6 +1309,13 @@ pub fn prepare(
     .map_err(|v| format!("Launch blocked by workflow policy: {}", join(&v)))?;
     notices.extend(std::mem::take(&mut brief.notices));
     brief.notices = notices;
+    // Only skills for roles this brief actually runs (or its reviewer) were missing for it.
+    let review_role = brief.review.as_ref().map(|r| r.role.clone());
+    brief.unavailable.extend(fallback.into_iter().filter(|u| {
+        brief.roles.iter().any(|r| r.id == u.role) || review_role.as_deref() == Some(&u.role)
+    }));
+    brief.unavailable.sort();
+    brief.unavailable.dedup();
     Ok(brief)
 }
 

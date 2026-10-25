@@ -75,6 +75,10 @@ Trust is re-checked against the disk, not against the loaded object. `trust` and
 
 A plugin may contain at most 10,000 entries and 64 MiB; larger ones are refused.
 
+## Provenance
+
+A run that offers plugin skills records them in `run-manifest.json` (see [Run provenance](PROVENANCE.md)). A plugin appears as `activated`: it was trusted at that fingerprint when the brief was built. A skill appears as `offered`: its path was written into the lead's instructions. Whether anyone read a skill is never observed (`observed: not_observed`), and whether a named teammate used its skill is unverified. MCP servers appear only as `declared_not_launched`.
+
 ## Not in this version
 
 - Plugin MCP servers are validated and can be trusted, but no launch runs them. The Claude adapter does not pass them to Claude Code, and the adapter report lists them as unsupported. Use `--plugin` to inspect and trust a plugin; trust does not start its servers.

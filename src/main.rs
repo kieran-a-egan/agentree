@@ -16,6 +16,7 @@ mod model;
 mod plugins;
 mod profiles;
 mod prompt;
+mod provenance;
 mod pty;
 mod roles;
 mod scroll;
@@ -73,7 +74,7 @@ struct Args {
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["project", "issue", "objective", "demo"]
+        conflicts_with_all = ["project", "issue", "objective", "demo", "run_manifest"]
     )]
     plugin: Option<PathBuf>,
     /// With --plugin: trust the plugin as it is now, letting runs use its skills and MCP servers.
@@ -86,20 +87,27 @@ struct Args {
     #[arg(
         long,
         value_name = "DIR",
-        conflicts_with_all = ["project", "issue", "objective", "demo", "plugin"]
+        conflicts_with_all = ["project", "issue", "objective", "demo", "plugin", "run_manifest"]
     )]
     instructions: Option<PathBuf>,
     /// Run the workflow in FILE (agentree.workflow/1) instead of the built-in software-engineering one.
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["plugin", "instructions"])]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["plugin", "instructions", "run_manifest"])]
     workflow: Option<PathBuf>,
     /// Execution path for the workflow: fast, balanced (default) or thorough. The budget cap still applies.
     #[arg(
         long,
         value_name = "PATH",
         value_parser = adapter::parse_path,
-        conflicts_with_all = ["plugin", "instructions"]
+        conflicts_with_all = ["plugin", "instructions", "run_manifest"]
     )]
     workflow_path: Option<workflow::contract::ExecutionPath>,
+    /// Print the sanitized provenance manifest (run-manifest.json) of the run with this id.
+    #[arg(
+        long,
+        value_name = "RUN_ID",
+        conflicts_with_all = ["project", "issue", "objective", "demo", "plugin", "instructions"]
+    )]
+    run_manifest: Option<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Prefs {
@@ -737,7 +745,9 @@ impl App {
             None => prompt::system_policy(&self.attention_file, &self.session_id, &plan),
         };
         // A resolver error must not block the launch: no note, and the reason is recorded.
-        let (note, provenance, status) = match instructions::resolve(&project) {
+        // The one resolution: the lead's note, the human report and the manifest all come from it.
+        let resolved = instructions::resolve(&project);
+        let (note, provenance, status) = match &resolved {
             Ok(r) => (r.lead_note(), r.render(), r.status_line()),
             Err(e) => (
                 None,
@@ -745,16 +755,31 @@ impl App {
                 Some(format!("Instructions: could not be resolved ({e})")),
             ),
         };
-        if let Some(note) = note {
+        if let Some(note) = &note {
             policy.push_str("\n\n");
-            policy.push_str(&note);
+            policy.push_str(note);
         }
         // Provenance for this run, next to the policy it produced.
         fs::write(self.run_dir.join("instructions-resolved.txt"), provenance)?;
-        fs::write(&policy_file, policy)?;
+        fs::write(&policy_file, &policy)?;
         if let Some(b) = &brief {
             fs::write(self.run_dir.join("adapter-report.txt"), b.report())?;
         }
+        // Provenance of exactly what was just decided. A failure here never blocks the launch
+        // (nothing it records is a permission or a trust decision); it is reported instead.
+        let manifest = provenance::build(&provenance::Inputs {
+            run_id: &self.session_id,
+            launch: if cli.is_some() {
+                provenance::LaunchState::Prepared
+            } else {
+                provenance::LaunchState::Simulated
+            },
+            brief: brief.as_ref(),
+            instructions: resolved.as_ref().ok(),
+            note: note.as_deref(),
+            policy: &policy,
+        });
+        let manifest_error = provenance::write(&self.run_dir, &manifest).err();
         let initial = prompt::initial_objective(&self.objective, &plan);
         self.terminal_expanded = false;
         self.dashboard_expanded = false;
@@ -768,7 +793,7 @@ impl App {
         self.agent_done_elapsed.clear();
         self.session_started_at = SystemTime::now();
         if let Some(cli) = cli {
-            self.session = Some(pty::spawn(
+            let spawned = pty::spawn(
                 &cli,
                 &plan,
                 &project,
@@ -776,11 +801,26 @@ impl App {
                 &policy_file,
                 &initial,
                 (rows, cols),
-            )?);
+            );
+            // The manifest says only how far the launch got, never that Claude read anything.
+            let outcome = if spawned.is_ok() {
+                provenance::LaunchState::Spawned
+            } else {
+                provenance::LaunchState::SpawnFailed
+            };
+            let manifest_error = match manifest_error {
+                None => provenance::mark(&self.run_dir, outcome).err(),
+                err => err,
+            };
+            self.session = Some(spawned?);
             self.message = format!(
                 "Claude process launched. Waiting for terminal startup | {}",
                 self.session_id
             );
+            if let Some(e) = manifest_error {
+                self.message
+                    .push_str(&format!(" | Provenance manifest not recorded: {e}"));
+            }
             if let Some(line) = status {
                 self.message.push_str(&format!(" | {line}"));
             }
@@ -973,6 +1013,7 @@ impl App {
                 "child_pid": self.session.as_ref().and_then(|s|s.child.process_id()),
                 "child_exit": self.child_exit,
                 "terminal_queries_answered": self.session.as_ref().map(|s|s.handshake_responses).unwrap_or(0),
+                "run_manifest_present": self.run_dir.join(provenance::FILE).is_file(),
             });
             if let Ok(json) = serde_json::to_vec_pretty(&state) {
                 let _ = fs::write(self.run_dir.join("startup-status.json"), json);
@@ -1519,6 +1560,14 @@ fn main() -> Result<()> {
         print!("{report}");
         return Ok(());
     }
+    if let Some(id) = &args.run_manifest {
+        print!(
+            "{}",
+            provenance::export(&data_home().join("runs"), id)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+        );
+        return Ok(());
+    }
     if let Some(dir) = &args.instructions {
         print!(
             "{}",
@@ -1670,6 +1719,69 @@ mod tests {
         };
         let mut a = App::new(args);
         assert!(a.start(ratatui::layout::Rect::new(0, 0, 140, 40)).is_err());
+    }
+    #[test]
+    fn a_simulated_launch_records_provenance_that_matches_the_files_it_wrote() {
+        let project = std::env::temp_dir().join(format!("agentree-prov-start-{}", Uuid::new_v4()));
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("AGENTS.md"), "hello").unwrap();
+        // Another tool's file is located but never read, and must not stop the manifest.
+        fs::write(project.join("GEMINI.md"), "other tool").unwrap();
+        let mut a = App::new(Args {
+            project: Some(project.clone()),
+            objective: Some("secret objective sk-live-1".into()),
+            demo: true,
+            ..Args::default()
+        });
+        a.start(ratatui::layout::Rect::new(0, 0, 140, 40)).unwrap();
+        let text = fs::read_to_string(a.run_dir.join(provenance::FILE)).unwrap();
+        let m = provenance::parse(text.as_bytes()).unwrap();
+        // Demo launches nothing, so no workflow, plugin or skill can be claimed.
+        assert_eq!(m.launch, provenance::LaunchState::Simulated);
+        assert!(m.workflow.is_none() && m.plugins.is_empty() && m.skills.is_empty());
+        assert_eq!(m.run_id, a.session_id);
+        // The manifest identifies the very policy file written for this run, note included.
+        let policy = fs::read(a.run_dir.join("instructions.txt")).unwrap();
+        assert_eq!(m.lead_policy.sha256, provenance::sha256(&policy));
+        assert_eq!(m.lead_policy.bytes, policy.len() as u64);
+        assert!(m.lead_policy.instruction_note.is_some());
+        let agents = m
+            .instructions
+            .sources
+            .iter()
+            .find(|s| s.path == "AGENTS.md")
+            .unwrap();
+        assert_eq!(
+            agents.sha256.as_deref(),
+            Some(provenance::sha256(b"hello").as_str())
+        );
+        let gemini = m
+            .instructions
+            .sources
+            .iter()
+            .find(|s| s.path == "GEMINI.md")
+            .unwrap();
+        assert_eq!(
+            gemini.disposition,
+            provenance::Disposition::NotUsedByBackend
+        );
+        assert!(gemini.sha256.is_none() && gemini.bytes.is_none());
+        assert!(!text.contains("sk-live") && !text.contains("objective"));
+        // The existing outputs are still written, and the sanitized export reads it back.
+        assert!(a.run_dir.join("instructions-resolved.txt").is_file());
+        let runs = a.run_dir.parent().unwrap();
+        assert_eq!(provenance::export(runs, &a.session_id).unwrap(), text);
+        let _ = fs::remove_dir_all(&project);
+        let _ = fs::remove_dir_all(&a.run_dir);
+    }
+    #[test]
+    fn run_manifest_flag_is_an_inspection_mode() {
+        let parse =
+            |a: &[&str]| Args::try_parse_from(std::iter::once("agentree").chain(a.iter().copied()));
+        assert!(parse(&["--run-manifest", "x"]).is_ok());
+        assert!(parse(&["--run-manifest", "x", "--demo"]).is_err());
+        assert!(parse(&["--run-manifest", "x", "--instructions", "d"]).is_err());
+        assert!(parse(&["--run-manifest", "x", "--workflow-path", "fast"]).is_err());
     }
     #[test]
     fn launch_is_blocked_by_an_invalid_plan_and_opens_the_matrix() {

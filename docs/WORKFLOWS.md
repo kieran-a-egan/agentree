@@ -208,6 +208,8 @@ A skill is offered only if its plugin passes `Store::activate` at launch, which 
 
 The bundled plugin is searched for in this order: `AGENTREE_PLUGIN_DIR`; `%LOCALAPPDATA%\ClaudeAgentTree\plugins\software-engineering` (copied there by `install.ps1`); a `plugins\software-engineering` folder next to the executable; the same relative folder two levels up (for a build in a checkout's `target` folder); and the checkout's own `plugins` folder. If none is found, the notice says to re-run `install.ps1` or set `AGENTREE_PLUGIN_DIR`. Trust is per folder, so trust the copy that will be used.
 
+Every run's `run-manifest.json` records the workflow name, the chosen path, the stage-to-role list in dependency order, and the skill-to-role mapping for that path, including the advisor. Skills in the mapping are recorded as offered, not as read. See [Run provenance](PROVENANCE.md).
+
 ### Strict mode
 
 `strict_enforcement: true` turns each instruction-only or observed gap into a validation failure. On Claude native teams every strict workflow therefore fails validation, which is why the built-in workflow runs non-strict. With strict on, the launch also fails on any saved-setting conflict and on any unsupported policy, such as an MCP server.
