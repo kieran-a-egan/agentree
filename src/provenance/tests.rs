@@ -833,14 +833,18 @@ fn the_export_carries_no_secrets_contents_or_personal_paths() {
     for banned in private {
         assert!(!text.contains(&banned), "{banned} leaked:\n{text}");
     }
-    // A hostile version string was reduced to an allowlisted identifier.
-    assert_eq!(m.plugins[0].version.as_deref(), Some("1.0.0__31m"));
+    // A hostile version string is exported only as an opaque fingerprint.
+    assert_eq!(
+        m.plugins[0].version.as_deref(),
+        Some(opaque("1.0.0\u{1b}[31m").as_str())
+    );
     // The shape is the allowlist: an extra field carrying a secret is refused on read.
     let tampered = text.replacen("\"schema\"", "\"api_key\": \"sk-live-X\",\n  \"schema\"", 1);
     assert!(matches!(parse(tampered.as_bytes()), Err(Error::Corrupt(_))));
     // ...and so is a control character or an absolute path smuggled into an allowed field.
+    let hostile = opaque("1.0.0\u{1b}[31m");
     for bad in [
-        ("1.0.0", "1.0.0\\u001b[31m"),
+        (hostile.as_str(), "1.0.0\\u001b[31m"),
         ("\"AGENTS.md\"", "\"C:/Users/me/AGENTS.md\""),
         ("\"AGENTS.md\"", "\"/etc/passwd\""),
     ] {
@@ -854,6 +858,215 @@ fn the_export_carries_no_secrets_contents_or_personal_paths() {
 }
 
 // 12. --------------------------------------------------------------------------------------
+
+const SECRETS: [&str; 4] = [
+    "sk-live-WFNAME-0123456789abcdef",
+    "ghp_VERSIONSECRET0123456789abcdefghij",
+    "Bearer-SCHEMASECRET",
+    "AKIAFIELDNAME0123456789ABCDEF",
+];
+
+#[test]
+fn credentials_in_workflow_names_and_plugin_versions_are_not_exported() {
+    let w = World::new();
+    fs::write(
+        w.plugin.join("plugin.json"),
+        format!(
+            r#"{{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"software-engineering","version":"1.0.0-{}"}}"#,
+            SECRETS[1]
+        ),
+    )
+    .unwrap();
+    w.trust();
+    let mut b = w.brief(None);
+    b.workflow = SECRETS[0].into();
+    let m = manifest(Some(&b), None, LaunchState::Prepared);
+    let runs = runs_with(&m);
+    let text = export(&runs.0, RUN).unwrap();
+    for s in SECRETS {
+        assert!(!text.contains(s), "{s} leaked:\n{text}");
+    }
+    assert_eq!(m.workflow.as_ref().unwrap().name, opaque(SECRETS[0]));
+    assert_eq!(
+        m.plugins[0].version.as_deref(),
+        Some(opaque(&format!("1.0.0-{}", SECRETS[1])).as_str())
+    );
+    assert!(!m.skills.is_empty());
+    assert!(m
+        .skills
+        .iter()
+        .all(|s| s.version.as_deref() == m.plugins[0].version.as_deref()));
+
+    // Ordinary names and versions keep their identity.
+    assert_eq!(version("1.0.0"), "1.0.0");
+    assert_eq!(version("2.1.0-rc.3"), "2.1.0-rc.3");
+    assert_eq!(workflow_name(SE), SE);
+    assert_eq!(ident("test-runner_2"), "test-runner_2");
+    // Anything else is a stable fingerprint, not a copy.
+    for odd in ["1.0.0-sk-live", "v1", "1.0.0+ghp_x", "latest", "", "1..0"] {
+        assert!(version(odd).starts_with("sha256-"), "{odd}");
+        assert_eq!(version(odd), version(odd));
+    }
+    assert!(ident(SECRETS[3]).starts_with("sha256-"));
+    // Known ceiling: `ident` is a shape filter, so a short name-shaped value passes unchanged.
+    assert_eq!(ident("AKIAIOSFODNN7EXAMPLE"), "AKIAIOSFODNN7EXAMPLE");
+
+    // A manifest edited by hand to carry such text is refused, never re-exported.
+    let plugin_version = m.plugins[0].version.clone().unwrap();
+    for (from, to) in [
+        (opaque(SECRETS[0]), SECRETS[0].to_string()),
+        (plugin_version, "1.0.0-ghp_VERSIONSECRET".to_string()),
+    ] {
+        let t = text.replacen(&from, &to, 1);
+        assert!(parse(t.as_bytes()).is_err(), "{to}");
+    }
+}
+
+#[test]
+fn malformed_input_is_never_reflected_in_errors() {
+    let good = render(&manifest(None, None, LaunchState::Simulated));
+    let leak = |what: &str, bytes: &[u8]| {
+        let e = parse(bytes).unwrap_err();
+        for s in format!("{e}\n{e:?}").lines() {
+            for secret in SECRETS {
+                assert!(!s.contains(secret), "{what}: {s}");
+            }
+        }
+        assert!(e.to_string().len() < 160, "{what}: {e}");
+    };
+    // Unsupported schema, as a string and as a very long string.
+    leak(
+        "schema",
+        good.replacen("agentree.run-manifest", SECRETS[2], 1)
+            .as_bytes(),
+    );
+    leak(
+        "long schema",
+        good.replacen("agentree.run-manifest", &SECRETS[2].repeat(500), 1)
+            .as_bytes(),
+    );
+    // Unknown field names, top-level and nested.
+    leak(
+        "field",
+        good.replacen(
+            "\"schema\"",
+            &format!("\"{}\": 1,\n  \"schema\"", SECRETS[3]),
+            1,
+        )
+        .as_bytes(),
+    );
+    leak(
+        "nested field",
+        good.replacen(
+            "\"artifact\"",
+            &format!("\"{}\": 1,\n    \"artifact\"", SECRETS[3]),
+            1,
+        )
+        .as_bytes(),
+    );
+    // A bad enum value, a bad type and malformed JSON that contain a secret.
+    leak(
+        "enum value",
+        good.replacen("\"simulated\"", &format!("\"{}\"", SECRETS[0]), 1)
+            .as_bytes(),
+    );
+    leak(
+        "type",
+        good.replacen("\"simulated\"", &format!("[\"{}\"]", SECRETS[0]), 1)
+            .as_bytes(),
+    );
+    leak(
+        "syntax",
+        format!("{{\"schema\": \"{}\" oops", SECRETS[2]).as_bytes(),
+    );
+    // A rule break names the rule, not the value.
+    leak(
+        "rule",
+        good.replacen(
+            "\"run_id\": \"",
+            &format!("\"run_id\": \"{}", SECRETS[0]),
+            1,
+        )
+        .as_bytes(),
+    );
+    // The same through the file entry point: the export fails and prints nothing of the file.
+    let runs = Tmp::new();
+    fs::create_dir_all(runs.0.join(RUN)).unwrap();
+    fs::write(
+        runs.0.join(RUN).join(FILE),
+        good.replacen(
+            "\"schema\"",
+            &format!("\"{}\": 1,\n  \"schema\"", SECRETS[3]),
+            1,
+        ),
+    )
+    .unwrap();
+    let e = export(&runs.0, RUN).unwrap_err();
+    assert!(matches!(e, Error::Corrupt(_)));
+    assert!(!format!("{e} {e:?}").contains(SECRETS[3]));
+    // A forward version is reported by number only.
+    let e = parse(
+        good.replacen("\"version\": 1", "\"version\": 7", 1)
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("version 7"));
+}
+
+#[test]
+fn skills_omitted_by_the_fallback_are_each_accounted_for() {
+    let w = World::new();
+    // A valid, trusted plugin that lacks one of the skills the built-in workflow asks for.
+    fs::remove_dir_all(w.plugin.join("skills/plan")).unwrap();
+    w.trust();
+    let b = w.brief(Some(contract::ExecutionPath::Thorough));
+    // The whole workflow fell back, so no role or reviewer skill is offered. The advisor skill is
+    // resolved on its own and is available, so it is still offered and its plugin activated.
+    assert!(b.roles.iter().all(|r| r.skill.is_none()));
+    assert!(b.review.as_ref().unwrap().skill.is_none());
+    let m = manifest(Some(&b), None, LaunchState::Prepared);
+    assert_eq!(m.plugins.len(), 1);
+    assert_eq!(m.skills.len(), 1);
+    assert_eq!(m.skills[0].role, "advisor");
+    assert!(m.unavailable.iter().all(|u| u.role != "advisor"));
+
+    let asked = default_workflow(true).roles;
+    let review = b.review.as_ref().map(|r| r.role.clone());
+    let mut missing = 0;
+    for rd in asked.iter().filter(|r| r.skill.is_some()) {
+        let on_path = b.roles.iter().any(|r| r.id == rd.id) || review.as_deref() == Some(&rd.id);
+        let entries: Vec<_> = m
+            .unavailable
+            .iter()
+            .filter(|u| u.role == rd.id && u.kind == Kind::Skill)
+            .collect();
+        if !on_path {
+            continue;
+        }
+        let want = if rd.skill.as_ref().unwrap().name == "plan" {
+            missing += 1;
+            Reason::NoSuchItem
+        } else {
+            Reason::SuppressedByFallback
+        };
+        assert!(
+            entries.len() == 1 && entries[0].reason == want && entries[0].plugin == SE,
+            "{}: {entries:?}",
+            rd.id
+        );
+        assert_eq!(entries[0].name, rd.skill.as_ref().unwrap().name);
+    }
+    assert_eq!(missing, 1, "the planner must be on the thorough path");
+    // Suppressed skills are available, so they are never reported as untrusted or changed.
+    assert!(m
+        .unavailable
+        .iter()
+        .all(|u| matches!(u.reason, Reason::NoSuchItem | Reason::SuppressedByFallback)));
+    assert!(m
+        .unavailable
+        .iter()
+        .any(|u| u.reason == Reason::SuppressedByFallback));
+}
 
 #[test]
 fn run_ids_are_validated_and_cannot_reach_other_paths() {

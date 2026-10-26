@@ -358,6 +358,9 @@ pub enum Reason {
     /// Trusted before; its files changed or cannot be read now.
     Changed,
     NoSuchItem,
+    /// Available from a trusted plugin, but not offered because the whole workflow fell back to
+    /// its skill-free form. Not a statement that the skill is missing or untrusted.
+    SuppressedByFallback,
 }
 
 /// A fixed statement of what this manifest cannot establish. `docs/PROVENANCE.md` explains each.
@@ -434,23 +437,70 @@ pub fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-/// An identifier-safe copy of text that may come from a plugin or workflow file: allowlisted
-/// characters only, bounded, never empty.
-fn safe(s: &str) -> String {
-    let t: String = s
-        .chars()
-        .take(MAX_TEXT)
-        .map(|c| if allowed(c) { c } else { '_' })
-        .collect();
-    if t.is_empty() {
-        "unnamed".into()
+/// The one workflow name Agentree ships. Any other name is free text from a workflow file.
+const BUILTIN_WORKFLOW: &str = "software-engineering";
+/// The longest run of letters and digits an identifier may carry. Credentials are long unbroken
+/// runs; names and file names are not.
+const MAX_WORD: usize = 24;
+
+/// The export form of a value that cannot be exported as written: `sha256-` and the first 12 hex
+/// digits of its SHA-256. It names the value for comparison without containing any of it.
+fn opaque(s: &str) -> String {
+    format!("sha256-{}", &sha256(s.as_bytes())[..12])
+}
+
+fn is_opaque(s: &str) -> bool {
+    s.strip_prefix("sha256-")
+        .is_some_and(|h| h.len() == 12 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// An identifier for export. Kept when it is short, made of `A-Z a-z 0-9 . _ -` and has no long
+/// unbroken run of letters and digits; otherwise replaced by its [`opaque`] form. This is a shape
+/// filter, not secret detection: a short secret that looks like a name is not recognized, which
+/// is why free-form fields use [`workflow_name`] and [`version`] instead.
+fn ident(s: &str) -> String {
+    let shaped = !s.is_empty()
+        && s.len() <= MAX_TEXT
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && s.split(['.', '_', '-']).all(|w| w.len() <= MAX_WORD);
+    if shaped {
+        s.into()
     } else {
-        t
+        opaque(s)
     }
 }
 
-fn allowed(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '/' | ' ')
+/// A `/`-separated relative path for export, each component through [`ident`].
+fn rel_path(s: &str) -> String {
+    s.split('/').map(ident).collect::<Vec<_>>().join("/")
+}
+
+/// Workflow names are free text, so only the built-in name is exported as written.
+fn workflow_name(s: &str) -> String {
+    if s == BUILTIN_WORKFLOW || is_opaque(s) {
+        s.into()
+    } else {
+        opaque(s)
+    }
+}
+
+/// Plugin versions are free text. Only `N`, `N.N`, `N.N.N` or `N.N.N.N` (up to nine digits each),
+/// optionally followed by `-alpha`, `-beta`, `-rc`, `-pre` or `-dev` and an optional `.N`, are
+/// exported as written.
+fn version(s: &str) -> String {
+    let (core, pre) = s.split_once('-').map_or((s, None), |(c, p)| (c, Some(p)));
+    let num = |n: &str| (1..=9).contains(&n.len()) && n.bytes().all(|b| b.is_ascii_digit());
+    let core_ok = (1..=4).contains(&core.split('.').count()) && core.split('.').all(num);
+    let pre_ok = pre.is_none_or(|p| {
+        let (label, n) = p.split_once('.').map_or((p, None), |(l, n)| (l, Some(n)));
+        matches!(label, "alpha" | "beta" | "rc" | "pre" | "dev") && n.is_none_or(num)
+    });
+    if (core_ok && pre_ok) || is_opaque(s) {
+        s.into()
+    } else {
+        opaque(s)
+    }
 }
 
 pub fn build(i: &Inputs) -> Manifest {
@@ -504,7 +554,7 @@ pub fn build(i: &Inputs) -> Manifest {
         (None, Vec::new(), Vec::new(), Vec::new(), Vec::new());
     if let Some(b) = i.brief {
         workflow = Some(Workflow {
-            name: safe(&b.workflow),
+            name: workflow_name(&b.workflow),
             path: match b.decision.path {
                 ExecutionPath::Fast => PathKind::Fast,
                 ExecutionPath::Balanced => PathKind::Balanced,
@@ -515,8 +565,8 @@ pub fn build(i: &Inputs) -> Manifest {
                 .iter()
                 .zip(&b.flow)
                 .map(|((stage, _), f)| StageEntry {
-                    stage: safe(stage),
-                    role: safe(&f.role_id),
+                    stage: ident(stage),
+                    role: ident(&f.role_id),
                 })
                 .collect(),
         });
@@ -524,19 +574,19 @@ pub fn build(i: &Inputs) -> Manifest {
             .activated
             .iter()
             .map(|p| PluginEntry {
-                name: safe(&p.name),
-                version: p.version.as_deref().map(safe),
+                name: ident(&p.name),
+                version: p.version.as_deref().map(version),
                 fingerprint: p.fingerprint.clone(),
                 status: PluginStatus::Activated,
             })
             .collect();
         let offer = |role: &str, s: &crate::adapter::SkillUse, audience| SkillEntry {
-            role: safe(role),
-            plugin: safe(&s.plugin),
-            skill: safe(&s.name),
-            version: s.version.as_deref().map(safe),
+            role: ident(role),
+            plugin: ident(&s.plugin),
+            skill: ident(&s.name),
+            version: s.version.as_deref().map(version),
             fingerprint: s.fingerprint.clone(),
-            source: safe(&s.source),
+            source: rel_path(&s.source),
             audience,
             status: SkillStatus::Offered,
             observed: Observation::NotObserved,
@@ -548,9 +598,9 @@ pub fn build(i: &Inputs) -> Manifest {
             for m in &r.mcp {
                 let (plugin, server) = m.split_once('/').unwrap_or(("", m));
                 mcp.push(McpEntry {
-                    role: safe(&r.id),
-                    plugin: safe(plugin),
-                    server: safe(server),
+                    role: ident(&r.id),
+                    plugin: ident(plugin),
+                    server: ident(server),
                     status: McpStatus::DeclaredNotLaunched,
                 });
             }
@@ -567,19 +617,20 @@ pub fn build(i: &Inputs) -> Manifest {
             .unavailable
             .iter()
             .map(|u| UnavailableEntry {
-                role: safe(&u.role),
+                role: ident(&u.role),
                 kind: match u.kind {
                     ItemKind::Skill => Kind::Skill,
                     ItemKind::Mcp => Kind::Mcp,
                 },
-                plugin: safe(&u.plugin),
-                name: safe(&u.name),
+                plugin: ident(&u.plugin),
+                name: ident(&u.name),
                 reason: match u.why {
                     Why::NotLoaded => Reason::NotLoaded,
                     Why::Ambiguous => Reason::Ambiguous,
                     Why::Untrusted => Reason::Untrusted,
                     Why::Changed => Reason::Changed,
                     Why::NoSuchItem => Reason::NoSuchItem,
+                    Why::Suppressed => Reason::SuppressedByFallback,
                 },
             })
             .collect();
@@ -603,7 +654,7 @@ pub fn build(i: &Inputs) -> Manifest {
         schema: SCHEMA.into(),
         version: VERSION,
         run_id: i.run_id.into(),
-        agentree_version: safe(env!("CARGO_PKG_VERSION")),
+        agentree_version: version(env!("CARGO_PKG_VERSION")),
         backend: Backend::ClaudeNativeTeams,
         launch: i.launch,
         workflow,
@@ -680,7 +731,7 @@ fn instruction_section(r: &Resolved, noted: bool) -> Instructions {
             }
         };
         SourceEntry {
-            path: safe(&rel(&s.path)),
+            path: rel_path(&rel(&s.path)),
             family,
             file,
             bytes: s.digest.as_ref().map(|d| d.1),
@@ -736,12 +787,14 @@ pub enum Error {
     /// inside the runs folder.
     Unsafe,
     TooLarge,
-    /// Not JSON, truncated, or does not match the schema.
-    Corrupt(String),
-    /// A different schema or a version this Agentree does not read.
+    /// Not JSON, truncated, or does not match the schema. A fixed category, never parser text:
+    /// serde messages quote the offending field names and values.
+    Corrupt(&'static str),
+    /// A different schema or a version this Agentree does not read. Holds a fixed phrase and at
+    /// most a version number.
     Unsupported(String),
-    /// Valid JSON of the right version that breaks a manifest rule.
-    Invalid(String),
+    /// Valid JSON of the right version that breaks a manifest rule. A fixed rule name.
+    Invalid(&'static str),
     Io(String),
 }
 
@@ -760,7 +813,7 @@ impl fmt::Display for Error {
     }
 }
 
-/// Untrusted text in a message: printable ASCII only, short.
+/// An OS error kind in a message: printable ASCII only, short. Never used for file content.
 fn clip(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -778,24 +831,26 @@ fn hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// True when `s` is exactly what [`ident`] would export, so a forged or edited manifest cannot
+/// carry text the exporter would have replaced.
 fn text_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().count() <= MAX_TEXT && s.chars().all(allowed)
+    ident(s) == s
 }
 
 fn rel_ok(s: &str) -> bool {
-    text_ok(s) && !s.starts_with('/') && !s.split('/').any(|p| p.is_empty() || p == "..")
+    s.len() <= MAX_TEXT && !s.split('/').any(|p| p.is_empty() || p == "..") && rel_path(s) == s
 }
 
 /// The rules every manifest obeys, on write and on read. Returns the first one broken.
-pub fn validate(m: &Manifest) -> Result<(), String> {
-    let bad = |what: &str| Err(what.to_string());
+pub fn validate(m: &Manifest) -> Result<(), &'static str> {
+    let bad = |what: &'static str| Err(what);
     if m.schema != SCHEMA || m.version != VERSION {
         return bad("schema or version");
     }
     if parse_run_id(&m.run_id).is_err() {
         return bad("run_id");
     }
-    if !text_ok(&m.agentree_version) {
+    if version(&m.agentree_version) != m.agentree_version {
         return bad("agentree_version");
     }
     if m.lead_policy.artifact != "instructions.txt" || !hex64(&m.lead_policy.sha256) {
@@ -817,7 +872,7 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
         return bad("too many entries");
     }
     if let Some(w) = &m.workflow {
-        if !text_ok(&w.name)
+        if workflow_name(&w.name) != w.name
             || w.stages.len() > MAX_ITEMS
             || w.stages
                 .iter()
@@ -826,7 +881,7 @@ pub fn validate(m: &Manifest) -> Result<(), String> {
             return bad("workflow");
         }
     }
-    let opt = |v: &Option<String>| v.as_deref().is_none_or(text_ok);
+    let opt = |v: &Option<String>| v.as_deref().is_none_or(|v| version(v) == v);
     for p in &m.plugins {
         if !text_ok(&p.name) || !opt(&p.version) || !hex64(&p.fingerprint) {
             return bad("plugins");
@@ -930,14 +985,15 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest, Error> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(Error::TooLarge);
     }
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|e| Error::Corrupt(clip(&e.to_string())))?;
-    let schema = value.get("schema").and_then(Value::as_str);
-    if schema != Some(SCHEMA) {
-        return Err(Error::Unsupported(format!(
-            "schema {}",
-            clip(schema.unwrap_or("missing"))
-        )));
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| {
+        Error::Corrupt(match e.classify() {
+            serde_json::error::Category::Eof => "truncated JSON",
+            serde_json::error::Category::Syntax => "not valid JSON",
+            _ => "unreadable JSON",
+        })
+    })?;
+    if value.get("schema").and_then(Value::as_str) != Some(SCHEMA) {
+        return Err(Error::Unsupported("unrecognized schema".into()));
     }
     match value.get("version").and_then(Value::as_u64) {
         Some(v) if v == u64::from(VERSION) => {}
@@ -946,10 +1002,10 @@ pub fn parse(bytes: &[u8]) -> Result<Manifest, Error> {
                 "version {v}; this Agentree reads version {VERSION}"
             )))
         }
-        None => return Err(Error::Corrupt("version missing".into())),
+        None => return Err(Error::Corrupt("version missing")),
     }
-    let m: Manifest =
-        serde_json::from_value(value).map_err(|e| Error::Corrupt(clip(&e.to_string())))?;
+    let m: Manifest = serde_json::from_value(value)
+        .map_err(|_| Error::Corrupt("does not match the manifest schema"))?;
     validate(&m).map_err(Error::Invalid)?;
     Ok(m)
 }
@@ -996,7 +1052,7 @@ pub fn load(runs: &Path, id: &str) -> Result<Manifest, Error> {
     }
     let m = parse(&read_file(&file)?)?;
     if m.run_id != id {
-        return Err(Error::Invalid("run_id does not match the folder".into()));
+        return Err(Error::Invalid("run_id does not match the folder"));
     }
     Ok(m)
 }

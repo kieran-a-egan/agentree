@@ -78,7 +78,7 @@ The status file `startup-status.json` gains `run_manifest_present`, which is tru
 | `skills[].audience` | `lead`: the lead is told to read the file. `teammate_prompt`: the lead is told to put "read this file" into a named teammate's prompt. |
 | `mcp[].status` | `declared_not_launched`: the plugin declares it; Agentree starts no MCP server and cannot hand it to Claude Code in this release. |
 | `unavailable[].kind` | `skill`; `mcp`. |
-| `unavailable[].reason` | `not_loaded` (missing, or rejected when loaded); `ambiguous` (two loaded plugins share the name); `untrusted` (never trusted, or revoked); `changed` (trusted before, files changed or unreadable now); `no_such_item` (trusted plugin has no such skill or server). |
+| `unavailable[].reason` | `not_loaded` (missing, or rejected when loaded); `ambiguous` (two loaded plugins share the name); `untrusted` (never trusted, or revoked); `changed` (trusted before, files changed or unreadable now); `no_such_item` (trusted plugin has no such skill or server); `suppressed_by_fallback` (the skill is available from a trusted plugin, but the built-in workflow fell back to its skill-free form because another requested skill was missing, untrusted or changed, so this one is not offered; it is not missing or untrusted). Every skill the built-in workflow requested for a role it runs appears either in `skills` or in `unavailable`. |
 
 ### Warning codes
 
@@ -327,9 +327,11 @@ Proven means Agentree established it from its own reads and decisions at the tim
 
 - The manifest is a closed, typed model. Every field is an enum, an identifier, a count, a path relative to its root, or a SHA-256 digest. Unknown fields are rejected on read.
 - It never contains: credentials; instruction or skill contents; prompts; objectives; transcripts; MCP commands, arguments, environment or config; absolute paths; control characters; free-form error text.
-- Names and paths use only `A-Z a-z 0-9 . _ + / -` and space, at most 96 characters. Anything else becomes `_`.
+- Free-form values are not copied. A workflow name is exported as written only if it is the built-in `software-engineering`; any other name becomes `sha256-` and 12 hex digits of its SHA-256. A plugin version is exported as written only if it is `N`, `N.N`, `N.N.N` or `N.N.N.N` (up to nine digits each), optionally followed by `-alpha`, `-beta`, `-rc`, `-pre` or `-dev` and an optional `.N`; anything else (including `1.0.0-<anything else>` and build metadata) becomes the same `sha256-` form. The form identifies a value for comparison; it does not contain it.
+- Other identifiers (plugin, skill, role, stage and MCP server names, and each component of a path) are exported as written only if they are at most 96 characters of `A-Z a-z 0-9 . _ -` with no run of letters and digits longer than 24 characters; otherwise they become the `sha256-` form. This is a shape check, not secret detection. Plugin and skill names are already limited by the plugin loader to lowercase letters, digits, `-` and `.` (at most 64 characters); role and stage ids to letters, digits, `-` and `_` (at most 48). MCP server names are the keys of the plugin's `mcp.json` and are not otherwise limited, so only the shape check applies to them. A short secret that passes the shape check, such as a 20-character access key id, would still be exported as a name. The same checks run on read, so a hand-edited manifest carrying other text is refused.
 - Paths are project-relative for instruction files and plugin-relative for skills.
-- Hashes are the only trace of file content. A SHA-256 of a low-entropy file (a common `CLAUDE.md` template, for example) can be matched by anyone who already has the same file. Treat an export as safe for internal sharing, not for publication.
+- Errors from `--run-manifest` are fixed, categorical messages (not valid JSON, truncated, schema mismatch, unrecognized schema, a version number, or a named rule). They never quote the file's schema string, field names, values or parser text.
+- Hashes are the only trace of file content, and the `sha256-` forms are hashes of short values. A SHA-256 of a low-entropy input (a common `CLAUDE.md` template, or a guessable workflow name) can be matched by anyone who already has or can guess the same input. The export is built to leave out credentials and file contents, but Agentree cannot prove that an export is safe to publish; review it before sharing outside your team. It is intended for internal sharing and audit.
 
 ## Failure policy
 
@@ -346,6 +348,8 @@ Proven means Agentree established it from its own reads and decisions at the tim
 - **Plugins after activation.** The fingerprint is the one trusted at brief time. `Store::activate` is not run again at spawn, so a change in that window is not caught.
 - **Older runs.** Runs from before this feature have no manifest.
 - **Read limits.** Instruction files over 256 KiB, and import searches over their limits, are reported as unverified. See [Project instructions](INSTRUCTIONS.md#limits).
+- **Schema version.** `unavailable[].reason` gained `suppressed_by_fallback` without a version bump. A build from before that value rejects a manifest that uses it as corrupt. Reading is also stricter than before: a manifest whose names or versions contain text the exporter would now replace (a space, `+`, a long unbroken run, a free-form version) is refused as invalid.
+- **Advisor skill after a fallback.** The advisor skill is resolved separately from the role skills. When the built-in workflow falls back because a role skill is missing, the advisor skill can still be offered, so `skills` and `plugins` may hold that one entry beside a list of `unavailable` role skills.
 - **Not tamper-evident.** There is no signature. Anyone who can write the run folder can change the file, and `--run-manifest` checks its shape and rules, not its authenticity.
 
 ## Relationship to the v0.6 release gate

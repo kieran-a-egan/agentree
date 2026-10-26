@@ -80,6 +80,9 @@ pub enum Why {
     Changed,
     /// The plugin is trusted but does not have the named skill or server.
     NoSuchItem,
+    /// The skill is available from a trusted plugin, but the whole workflow fell back to its
+    /// skill-free form because another requested skill was not, so this one is not offered.
+    Suppressed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1273,15 +1276,17 @@ pub fn prepare(
                 notices.extend(v.iter().map(|x| format!("Skills not loaded: {x}")));
                 for rd in contract::default_workflow(true).roles {
                     if let Some(r) = &rd.skill {
-                        if let Err(gone) = activate(r, &env.plugins, &env.trust) {
-                            fallback.push(Unavailable {
-                                role: rd.id.clone(),
-                                kind: ItemKind::Skill,
-                                plugin: r.plugin.clone(),
-                                name: r.name.clone(),
-                                why: gone.why,
-                            });
-                        }
+                        // Every requested skill is accounted for: a missing one by its own
+                        // reason, an available one as suppressed by the whole-workflow fallback.
+                        fallback.push(Unavailable {
+                            role: rd.id.clone(),
+                            kind: ItemKind::Skill,
+                            plugin: r.plugin.clone(),
+                            name: r.name.clone(),
+                            why: skill_use(r, &env.plugins, &env.trust)
+                                .err()
+                                .map_or(Why::Suppressed, |gone| gone.why),
+                        });
                     }
                 }
                 validate(contract::default_workflow(false), &registry, &env)
