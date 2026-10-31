@@ -734,7 +734,8 @@ fn a_declared_mcp_server_is_never_marked_launched() {
     let m = manifest(Some(&b), None, LaunchState::Prepared);
     validate(&m).unwrap();
     assert_eq!(m.mcp.len(), 1);
-    assert_eq!(m.mcp[0].server, "demo");
+    assert_eq!(m.mcp[0].server, opaque("demo"));
+    assert_eq!(m.mcp[0].plugin, SE);
     assert_eq!(m.mcp[0].role, "explorer");
     assert_eq!(m.mcp[0].status, McpStatus::DeclaredNotLaunched);
     assert!(m.limitations.contains(&Limitation::McpServersNotLaunched));
@@ -901,15 +902,24 @@ fn credentials_in_workflow_names_and_plugin_versions_are_not_exported() {
     assert_eq!(version("1.0.0"), "1.0.0");
     assert_eq!(version("2.1.0-rc.3"), "2.1.0-rc.3");
     assert_eq!(workflow_name(SE), SE);
-    assert_eq!(ident("test-runner_2"), "test-runner_2");
+    assert_eq!(ident("planner"), "planner");
     // Anything else is a stable fingerprint, not a copy.
     for odd in ["1.0.0-sk-live", "v1", "1.0.0+ghp_x", "latest", "", "1..0"] {
         assert!(version(odd).starts_with("sha256-"), "{odd}");
         assert_eq!(version(odd), version(odd));
     }
     assert!(ident(SECRETS[3]).starts_with("sha256-"));
-    // Known ceiling: `ident` is a shape filter, so a short name-shaped value passes unchanged.
-    assert_eq!(ident("AKIAIOSFODNN7EXAMPLE"), "AKIAIOSFODNN7EXAMPLE");
+    // No shape check: short, ordinary-looking and credential-shaped values are all opaque.
+    for odd in [
+        "AKIAIOSFODNN7EXAMPLE",
+        "test-runner_2",
+        "demo",
+        "x",
+        "sha256-0123456789ab",
+    ] {
+        assert_eq!(ident(odd), opaque(odd), "{odd}");
+        assert_eq!(ident(odd), ident(odd));
+    }
 
     // A manifest edited by hand to carry such text is refused, never re-exported.
     let plugin_version = m.plugins[0].version.clone().unwrap();
@@ -920,6 +930,176 @@ fn credentials_in_workflow_names_and_plugin_versions_are_not_exported() {
         let t = text.replacen(&from, &to, 1);
         assert!(parse(t.as_bytes()).is_err(), "{to}");
     }
+}
+
+// 12b. -------------------------------------------------------------------------------------
+
+#[test]
+fn credential_shaped_identifiers_are_opaque_and_keep_their_references() {
+    const STAGE: &str = "sk-live-9f8e7d6c";
+    const ROLE: &str = "akia1234exampl";
+    const PLUGIN: &str = "ghp-a1b2c3d4e5f6";
+    const SKILL: &str = "tok-9z8y7x6w5v";
+    const SERVER: &str = "xoxb-123456789";
+    let all = [STAGE, ROLE, PLUGIN, SKILL, SERVER];
+
+    let w = World::new();
+    let manifest_path = w.plugin.join("plugin.json");
+    let text = fs::read_to_string(&manifest_path)
+        .unwrap()
+        .replace("\"software-engineering\"", &format!("\"{PLUGIN}\""));
+    fs::write(&manifest_path, text).unwrap();
+    fs::rename(
+        w.plugin.join("skills/explore"),
+        w.plugin.join("skills").join(SKILL),
+    )
+    .unwrap();
+    let skill_md = w.plugin.join("skills").join(SKILL).join("SKILL.md");
+    let text = fs::read_to_string(&skill_md).unwrap();
+    fs::write(
+        &skill_md,
+        text.replacen("name: explore", &format!("name: {SKILL}"), 1),
+    )
+    .unwrap();
+    fs::write(
+        w.plugin.join("mcp.json"),
+        format!(
+            r#"{{"$schema":"{}","mcpServers":{{"{SERVER}":{{"type":"stdio","command":"demo-server"}}}}}}"#,
+            plugins::MCP_SCHEMA
+        ),
+    )
+    .unwrap();
+    w.trust();
+
+    // A valid custom workflow: credential-shaped stage and role ids, plugin, skill and MCP server.
+    let example = include_str!("../../examples/workflows/software-engineering.workflow.json");
+    let mut wf: serde_json::Value = serde_json::from_str(example).unwrap();
+    fn rename(v: &mut serde_json::Value, from: &str, to: &str) {
+        match v {
+            serde_json::Value::String(s) if s == from => *s = to.into(),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|x| rename(x, from, to)),
+            serde_json::Value::Object(o) => o.values_mut().for_each(|x| rename(x, from, to)),
+            _ => {}
+        }
+    }
+    rename(&mut wf, "risk-scan", STAGE);
+    rename(&mut wf, "explorer", ROLE);
+    rename(&mut wf, SE, PLUGIN);
+    wf["name"] = SE.into(); // the workflow's own name is a separate field
+    let explorer = wf["roles"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["id"] == ROLE)
+        .unwrap();
+    explorer["skill"]["name"] = SKILL.into();
+    explorer["tools"].as_array_mut().unwrap().push("mcp".into());
+    explorer["mcp"] = serde_json::json!([{ "plugin": PLUGIN, "name": SERVER }]);
+    let file = w.t.0.join("custom.workflow.json");
+    fs::write(&file, serde_json::to_string_pretty(&wf).unwrap()).unwrap();
+    let b = adapter::prepare(
+        &Settings::default(),
+        Some(&file),
+        Some(contract::ExecutionPath::Thorough),
+        &w.dirs(),
+    )
+    .unwrap();
+    let m = manifest(Some(&b), None, LaunchState::Prepared);
+    let runs = runs_with(&m);
+    let json = export(&runs.0, RUN).unwrap();
+    for s in all {
+        assert!(
+            !json.contains(s),
+            "{s} leaked:
+{json}"
+        );
+    }
+
+    // Each value is replaced by the same opaque form wherever it appears.
+    let wfm = m.workflow.as_ref().unwrap();
+    assert!(wfm.stages.iter().any(|s| s.stage == opaque(STAGE)));
+    assert!(wfm.stages.iter().any(|s| s.role == opaque(ROLE)));
+    assert!(wfm
+        .stages
+        .iter()
+        .any(|s| s.stage == "review" && s.role == "final_reviewer"));
+    assert_eq!(m.plugins[0].name, opaque(PLUGIN));
+    let skill = m.skills.iter().find(|s| s.skill == opaque(SKILL)).unwrap();
+    assert_eq!(skill.role, opaque(ROLE));
+    assert_eq!(skill.plugin, m.plugins[0].name);
+    assert_eq!(skill.source, format!("skills/{}/SKILL.md", opaque(SKILL)));
+    assert_eq!(m.mcp.len(), 1);
+    assert_eq!(
+        (
+            m.mcp[0].role.as_str(),
+            m.mcp[0].plugin.as_str(),
+            m.mcp[0].server.as_str()
+        ),
+        (
+            opaque(ROLE).as_str(),
+            m.plugins[0].name.as_str(),
+            opaque(SERVER).as_str()
+        )
+    );
+    // Fixed instruction paths and built-in names stay readable.
+    assert!(wfm
+        .stages
+        .iter()
+        .any(|s| s.stage == "plan" && s.role == "planner"));
+    for p in [
+        "AGENTS.md",
+        "CLAUDE.md",
+        ".claude/CLAUDE.md",
+        ".github/copilot-instructions.md",
+    ] {
+        assert_eq!(rel_path(p), p);
+    }
+
+    // The same values in an imported or hand-edited manifest are refused, and the refusal does
+    // not repeat them.
+    for s in all {
+        let from = format!("\"{}\"", opaque(s));
+        assert!(json.contains(&from), "{s}");
+        let t = json.replace(&from, &format!("\"{s}\""));
+        let e = parse(t.as_bytes()).unwrap_err();
+        let shown = format!(
+            "{e}
+{e:?}"
+        );
+        assert!(matches!(e, Error::Invalid(_)), "{shown}");
+        for v in all {
+            assert!(!shown.contains(v), "{v} in diagnostic: {shown}");
+        }
+    }
+    // A short, ordinary name is not trusted either.
+    let t = json.replace(&format!("\"{}\"", opaque(SERVER)), "\"demo\"");
+    assert!(parse(t.as_bytes()).is_err());
+    assert_eq!(parse(json.as_bytes()).unwrap(), m);
+}
+
+#[test]
+fn every_built_in_role_stage_and_skill_stays_readable() {
+    for with_review in [true, false] {
+        let def = default_workflow(with_review);
+        for id in def
+            .roles
+            .iter()
+            .map(|r| &r.id)
+            .chain(def.stages.iter().map(|s| &s.id))
+        {
+            assert_eq!(ident(id), *id, "{id} should be allowlisted");
+        }
+    }
+    let skills = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("plugins")
+        .join(SE)
+        .join("skills");
+    for e in fs::read_dir(skills).unwrap() {
+        let name = e.unwrap().file_name().to_string_lossy().into_owned();
+        assert_eq!(ident(&name), name, "{name} should be allowlisted");
+    }
+    assert_eq!(ident("advisor"), "advisor");
+    assert_eq!(ident(SE), SE);
 }
 
 #[test]

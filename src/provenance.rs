@@ -439,10 +439,6 @@ pub fn sha256(bytes: &[u8]) -> String {
 
 /// The one workflow name Agentree ships. Any other name is free text from a workflow file.
 const BUILTIN_WORKFLOW: &str = "software-engineering";
-/// The longest run of letters and digits an identifier may carry. Credentials are long unbroken
-/// runs; names and file names are not.
-const MAX_WORD: usize = 24;
-
 /// The export form of a value that cannot be exported as written: `sha256-` and the first 12 hex
 /// digits of its SHA-256. It names the value for comparison without containing any of it.
 fn opaque(s: &str) -> String {
@@ -454,21 +450,52 @@ fn is_opaque(s: &str) -> bool {
         .is_some_and(|h| h.len() == 12 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
-/// An identifier for export. Kept when it is short, made of `A-Z a-z 0-9 . _ -` and has no long
-/// unbroken run of letters and digits; otherwise replaced by its [`opaque`] form. This is a shape
-/// filter, not secret detection: a short secret that looks like a name is not recognized, which
-/// is why free-form fields use [`workflow_name`] and [`version`] instead.
+/// Fixed identifiers Agentree itself ships: the built-in plugin, its skills, roles and stages,
+/// and the instruction files Agentree looks for. Only these are exported as written.
+const BUILTIN: [&str; 27] = [
+    "software-engineering",
+    "advisor",
+    "explorer",
+    "researcher",
+    "planner",
+    "coder",
+    "tester",
+    "final_reviewer",
+    "explore",
+    "research",
+    "plan",
+    "implement",
+    "test",
+    "prepare-review",
+    "risk-scan",
+    "review",
+    "advise",
+    "skills",
+    "SKILL.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    ".claude",
+    "GEMINI.md",
+    ".github",
+    "copilot-instructions.md",
+    ".cursorrules",
+];
+
+/// An identifier for export: a [`BUILTIN`] name as written, everything else its [`opaque`] form,
+/// however short or ordinary it looks. The same input always gives the same output, so references
+/// between entries still match.
 fn ident(s: &str) -> String {
-    let shaped = !s.is_empty()
-        && s.len() <= MAX_TEXT
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        && s.split(['.', '_', '-']).all(|w| w.len() <= MAX_WORD);
-    if shaped {
+    if BUILTIN.contains(&s) {
         s.into()
     } else {
         opaque(s)
     }
+}
+
+/// True when `s` is what [`ident`] could have exported: a built-in name or an opaque form.
+fn ident_ok(s: &str) -> bool {
+    BUILTIN.contains(&s) || is_opaque(s)
 }
 
 /// A `/`-separated relative path for export, each component through [`ident`].
@@ -831,14 +858,8 @@ fn hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// True when `s` is exactly what [`ident`] would export, so a forged or edited manifest cannot
-/// carry text the exporter would have replaced.
-fn text_ok(s: &str) -> bool {
-    ident(s) == s
-}
-
 fn rel_ok(s: &str) -> bool {
-    s.len() <= MAX_TEXT && !s.split('/').any(|p| p.is_empty() || p == "..") && rel_path(s) == s
+    s.len() <= MAX_TEXT && s.split('/').all(ident_ok)
 }
 
 /// The rules every manifest obeys, on write and on read. Returns the first one broken.
@@ -876,14 +897,14 @@ pub fn validate(m: &Manifest) -> Result<(), &'static str> {
             || w.stages.len() > MAX_ITEMS
             || w.stages
                 .iter()
-                .any(|s| !text_ok(&s.stage) || !text_ok(&s.role))
+                .any(|s| !ident_ok(&s.stage) || !ident_ok(&s.role))
         {
             return bad("workflow");
         }
     }
     let opt = |v: &Option<String>| v.as_deref().is_none_or(|v| version(v) == v);
     for p in &m.plugins {
-        if !text_ok(&p.name) || !opt(&p.version) || !hex64(&p.fingerprint) {
+        if !ident_ok(&p.name) || !opt(&p.version) || !hex64(&p.fingerprint) {
             return bad("plugins");
         }
     }
@@ -891,7 +912,7 @@ pub fn validate(m: &Manifest) -> Result<(), &'static str> {
         let known = m.plugins.iter().any(|p| {
             p.name == s.plugin && p.fingerprint == s.fingerprint && p.version == s.version
         });
-        if !text_ok(&s.role) || !text_ok(&s.skill) || !rel_ok(&s.source) || !known {
+        if !ident_ok(&s.role) || !ident_ok(&s.skill) || !rel_ok(&s.source) || !known {
             return bad("skills");
         }
         // A skill cannot be both offered and unavailable.
@@ -903,12 +924,12 @@ pub fn validate(m: &Manifest) -> Result<(), &'static str> {
     }
     for s in &m.mcp {
         let known = m.plugins.iter().any(|p| p.name == s.plugin);
-        if !text_ok(&s.role) || !text_ok(&s.server) || !known {
+        if !ident_ok(&s.role) || !ident_ok(&s.server) || !known {
             return bad("mcp");
         }
     }
     for u in &m.unavailable {
-        if !text_ok(&u.role) || !text_ok(&u.plugin) || !text_ok(&u.name) {
+        if !ident_ok(&u.role) || !ident_ok(&u.plugin) || !ident_ok(&u.name) {
             return bad("unavailable");
         }
     }
