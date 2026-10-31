@@ -18,6 +18,7 @@
 //! file whose real location is outside the project is reported and never read. Paths are checked
 //! when resolved and read afterwards, so a file swapped in between is not caught.
 
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{ErrorKind, Read};
@@ -85,6 +86,24 @@ impl State {
 pub struct Source {
     pub path: PathBuf,
     pub state: State,
+    /// SHA-256 and length of the bytes Agentree actually read (set for `Ok` and `InvalidUtf8`;
+    /// a file that was not read, or was too large, has none). Not a guarantee of what Claude
+    /// Code reads later.
+    pub digest: Option<(String, u64)>,
+    /// A `claudeMdExcludes` pattern matches this file (for `AGENTS.md`: matches or could not be
+    /// evaluated, which is treated as excluded).
+    pub excluded: bool,
+}
+
+impl Source {
+    fn new(path: PathBuf, state: State) -> Source {
+        Source {
+            path,
+            state,
+            digest: None,
+            excluded: false,
+        }
+    }
 }
 
 /// What the user's settings say Claude Code loads on its own.
@@ -171,6 +190,9 @@ pub struct Resolved {
     pub import_gap: Option<String>,
     /// Files that could not be used, with the reason. Never contains file content.
     pub problems: Vec<String>,
+    /// A `claudeMdExcludes` setting could not be read or a pattern could not be evaluated, so
+    /// exclusion was not fully checked.
+    pub exclusions_unchecked: bool,
 }
 
 struct Loaded {
@@ -447,13 +469,18 @@ pub fn resolve(dir: &Path) -> Result<Resolved, String> {
     let (mode, mut notes) =
         mode_from_scopes(user_settings().as_deref(), managed_settings().as_deref());
     let mut patterns = Vec::new();
+    let mut unchecked = false;
     for file in exclusion_files(dir) {
         match excludes_from_settings(&file) {
             Ok(p) => patterns.extend(p),
-            Err(why) => notes.push(format!("claudeMdExcludes not checked: {why}")),
+            Err(why) => {
+                unchecked = true;
+                notes.push(format!("claudeMdExcludes not checked: {why}"));
+            }
         }
     }
     let mut resolved = resolve_with_excludes(dir, mode, &patterns)?;
+    resolved.exclusions_unchecked |= unchecked;
     resolved.problems.extend(notes);
     Ok(resolved)
 }
@@ -588,11 +615,21 @@ pub fn resolve_with_excludes(
         _ => None,
     };
     let native_live = claude[0].source.state == State::Ok && !hit(&claude[0]);
+    let mut shared_source = shared.source;
+    shared_source.excluded = shared_excluded;
+    let claude_sources = claude
+        .iter()
+        .map(|l| {
+            let mut s = l.source.clone();
+            s.excluded = hit(l);
+            s
+        })
+        .collect();
     Ok(Resolved {
         native_live,
         dir: dir.to_path_buf(),
-        shared: shared.source,
-        claude: claude.into_iter().map(|l| l.source).collect(),
+        shared: shared_source,
+        claude: claude_sources,
         others,
         mode,
         delivery,
@@ -600,6 +637,7 @@ pub fn resolve_with_excludes(
         ancestor,
         import_gap,
         problems,
+        exclusions_unchecked: !unevaluated.is_empty(),
     })
 }
 
@@ -632,7 +670,7 @@ fn display_name(dir: &Path, path: &Path) -> String {
 fn probe(dir: &Path, root: &Path, rel: &str) -> Source {
     let path = dir.join(rel);
     let (state, _) = locate(root, &path);
-    Source { path, state }
+    Source::new(path, state)
 }
 
 fn locate(root: &Path, path: &Path) -> (State, Option<PathBuf>) {
@@ -666,20 +704,27 @@ fn load(dir: &Path, root: &Path, rel: &str) -> Loaded {
     let (state, canon) = locate(root, &path);
     let Some(real) = canon else {
         return Loaded {
-            source: Source { path, state },
+            source: Source::new(path, state),
             canon: None,
             text: None,
         };
     };
-    let (state, text, canon) = match read_bounded(&real).map(|b| b.map(String::from_utf8)) {
-        Ok(Some(Ok(text))) => (State::Ok, Some(text), Some(real)),
-        Ok(Some(Err(_))) => (State::InvalidUtf8, None, Some(real)),
-        Ok(None) => (State::TooLarge, None, Some(real)),
-        Err(e) => (State::Unreadable(e.to_string()), None, Some(real)),
+    let (state, text, digest) = match read_bounded(&real) {
+        Ok(Some(bytes)) => {
+            let digest = Some((format!("{:x}", Sha256::digest(&bytes)), bytes.len() as u64));
+            match String::from_utf8(bytes) {
+                Ok(text) => (State::Ok, Some(text), digest),
+                Err(_) => (State::InvalidUtf8, None, digest),
+            }
+        }
+        Ok(None) => (State::TooLarge, None, None),
+        Err(e) => (State::Unreadable(e.to_string()), None, None),
     };
+    let mut source = Source::new(path, state);
+    source.digest = digest;
     Loaded {
-        source: Source { path, state },
-        canon,
+        source,
+        canon: Some(real),
         text,
     }
 }

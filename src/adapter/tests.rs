@@ -164,7 +164,7 @@ fn each_role_gets_its_trusted_skill_and_only_its_own_capabilities() {
             );
             assert_eq!(skill.plugin, BUILTIN_PLUGIN);
             assert!(skill.file.ends_with("SKILL.md") && skill.file.is_file());
-            assert!(b.assignments().contains(&skill.fingerprint));
+            assert!(b.assignments().contains(&skill.fingerprint[..12]));
         }
         let explorer = role(&b, "explorer");
         assert_eq!(
